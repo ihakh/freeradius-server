@@ -113,7 +113,7 @@ struct xlat_exp {
 
 		int		regex_index;	//!< for %{1} and friends.
 
-		int		count;		//!< for XLAT_CHILD
+		fr_token_t	quote;		//!< For child expansions.
 	};
 
 	/*

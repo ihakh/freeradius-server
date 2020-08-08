@@ -171,7 +171,7 @@ static rlm_rcode_t cache_merge(rlm_cache_t const *inst, REQUEST *request, rlm_ca
 		if (map_to_request(request, map, map_to_vp, NULL) < 0) {
 			char buffer[1024];
 
-			map_snprint(NULL, buffer, sizeof(buffer), map);
+			map_snprint(&FR_SBUFF_OUT(buffer, sizeof(buffer)), map);
 			REXDENT();
 			RDEBUG2("Skipping %s", buffer);
 			RINDENT();
@@ -391,7 +391,7 @@ static rlm_rcode_t cache_insert(rlm_cache_t const *inst, REQUEST *request, rlm_c
 				}
 
 				MEM(c_map->rhs = tmpl_alloc(c_map,
-							    TMPL_TYPE_DATA, map->rhs->name, map->rhs->len, quote));
+							    TMPL_TYPE_DATA, quote, map->rhs->name, map->rhs->len));
 				if (fr_value_box_copy(c_map->rhs, tmpl_value(c_map->rhs), &vp->data) < 0) {
 					REDEBUG("Failed copying attribute value");
 				error:
@@ -808,7 +808,9 @@ static ssize_t cache_xlat(TALLOC_CTX *ctx, char **out, UNUSED size_t freespace,
 			      request, inst->config.key, NULL, NULL);
 	if (key_len < 0) return -1;
 
-	slen = tmpl_afrom_attr_substr(ctx, NULL, &target, fmt, -1,
+	slen = tmpl_afrom_attr_substr(ctx, NULL, &target,
+				      &FR_SBUFF_IN(fmt, strlen(fmt)),
+				      NULL,
 				      &(tmpl_rules_t){
 				      		.dict_def = request->dict,
 				      		.prefix = TMPL_ATTR_REF_PREFIX_AUTO

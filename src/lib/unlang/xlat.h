@@ -51,6 +51,7 @@ typedef struct xlat_exp xlat_exp_t;
 #include <freeradius-devel/util/time.h>
 #include <freeradius-devel/util/pair.h>
 #include <freeradius-devel/util/value.h>
+#include <freeradius-devel/util/sbuff.h>
 
 /** Instance data for an xlat expansion node
  *
@@ -281,14 +282,23 @@ int		xlat_eval_pair(REQUEST *request, VALUE_PAIR *vp);
 bool		xlat_async_required(xlat_exp_t const *xlat);
 
 ssize_t		xlat_tokenize_ephemeral(TALLOC_CTX *ctx, xlat_exp_t **head, REQUEST *request,
-					char const *fmt, tmpl_rules_t const *rules);
+					fr_sbuff_t *in,
+					fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules);
 
-ssize_t		xlat_tokenize(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, ssize_t inlen, tmpl_rules_t const *rules);
+ssize_t 	xlat_tokenize_argv(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+				   fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules);
 
-ssize_t		xlat_tokenize_argv(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-				   tmpl_rules_t const *rules);
+ssize_t		xlat_tokenize(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+			      fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules);
 
-size_t		xlat_snprint(char *buffer, size_t bufsize, xlat_exp_t const *node);
+bool		xlat_is_literal(xlat_exp_t const *head);
+
+bool		xlat_to_literal(TALLOC_CTX *ctx, char **str, xlat_exp_t **head);
+
+ssize_t		xlat_print(fr_sbuff_t *in, xlat_exp_t const *node);
+
+static inline size_t xlat_aprint(TALLOC_CTX *ctx, char **out, xlat_exp_t const *node)
+SBUFF_OUT_TALLOC_FUNC_NO_LEN_DEF(xlat_print, node);
 
 #define XLAT_DEFAULT_BUF_LEN	2048
 

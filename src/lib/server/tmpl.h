@@ -32,13 +32,13 @@
  * where values or #VALUE_PAIR should be copied to.
  *
  * To create new #tmpl_t use one of the tmpl_*from_* functions.  These parse
- * strings into VPTs. The main parsing function is #tmpl_afrom_str, which can produce
+ * strings into VPTs. The main parsing function is #tmpl_afrom_substr, which can produce
  * most types of VPTs. It uses the type of quoting (passed as an #fr_token_t) to determine
  * what type of VPT to parse the string as. For example a #T_DOUBLE_QUOTED_STRING will
  * produce either a #TMPL_TYPE_XLAT_UNPARSED or a #TMPL_TYPE_UNPARSED (depending if the string
  * contained a non-literal expansion).
  *
- * @see tmpl_afrom_str
+ * @see tmpl_afrom_substr
  * @see tmpl_afrom_attr_str
  *
  * In the case of #TMPL_TYPE_ATTR and #TMPL_TYPE_LIST, there are special cursor overlay
@@ -122,6 +122,8 @@ typedef enum tmpl_type_e {
 	TMPL_TYPE_XLAT,	      		//!< Pre-parsed xlat expansion.
 
 	TMPL_TYPE_REGEX,	      	//!< Compiled (and possibly JIT'd) regular expression.
+	TMPL_TYPE_REGEX_XLAT,		//!< A regex containing xlat expansions.  Cannot be
+					///< pre-compiled.
 
 	/** @name Unparsed types
 	 *
@@ -161,6 +163,7 @@ typedef enum tmpl_type_e {
 #define tmpl_is_exec(vpt) 		(vpt->type == TMPL_TYPE_EXEC)
 
 #define tmpl_is_regex(vpt) 		(vpt->type == TMPL_TYPE_REGEX)
+#define tmpl_is_regex_xlat(vpt) 	(vpt->type == TMPL_TYPE_REGEX_XLAT)
 
 #define tmpl_is_unparsed(vpt) 		(vpt->type == TMPL_TYPE_UNPARSED)
 #define tmpl_is_attr_unparsed(vpt) 	(vpt->type == TMPL_TYPE_ATTR_UNPARSED)
@@ -170,8 +173,9 @@ typedef enum tmpl_type_e {
 extern fr_table_num_sorted_t const tmpl_type_table[];
 extern size_t tmpl_type_table_len;
 
-typedef struct tmpl_s tmpl_t;
+
 typedef struct tmpl_rules_s tmpl_rules_t;
+typedef struct tmpl_s tmpl_t;
 
 #include <freeradius-devel/unlang/xlat.h>
 #include <freeradius-devel/util/packet.h>
@@ -194,7 +198,7 @@ typedef struct tmpl_rules_s tmpl_rules_t;
  */
 typedef enum {
 	TMPL_ATTR_REF_PREFIX_YES = 0,			//!< Attribute refs must have '&' prefix.
-	TMPL_ATTR_REF_PREFIX_NO,				//!< Attribute refs have no '&' prefix.
+	TMPL_ATTR_REF_PREFIX_NO,			//!< Attribute refs have no '&' prefix.
 	TMPL_ATTR_REF_PREFIX_AUTO 			//!< Attribute refs may have a '&' prefix.
 } tmpl_attr_ref_prefix_t;
 
@@ -241,6 +245,8 @@ typedef enum {
 							///< may be resolved later.
 } tmpl_attr_type_t;
 
+#define TMPL_MAX_REQUEST_REF_NESTING	20
+
 #define NUM_ANY			INT16_MIN
 #define NUM_ALL			(INT16_MIN + 1)
 #define NUM_COUNT		(INT16_MIN + 2)
@@ -280,6 +286,7 @@ typedef struct {
  *
  * @{
  */
+#define ar_type				type
 #define ar_da				da
 #define ar_unknown			unknown.da
 #define ar_unparsed			unknown.name
@@ -345,7 +352,24 @@ struct tmpl_s {
 		};
 #endif
 	} data;
+
+	fr_type_t	cast;
+	tmpl_rules_t	_CONST rules;
 };
+
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_bareword_unquoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_double_unquoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_single_unquoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_solidus_unquoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_backtick_unquoted;
+extern fr_sbuff_parse_rules_t const *tmpl_parse_rules_unquoted[T_TOKEN_LAST];
+
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_bareword_quoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_double_quoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_single_quoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_solidus_quoted;
+extern fr_sbuff_parse_rules_t const tmpl_parse_rules_backtick_quoted;
+extern fr_sbuff_parse_rules_t const *tmpl_parse_rules_quoted[T_TOKEN_LAST];
 
 /** Convenience macro for printing a meaningful assert message when we get a bad tmpl type
  */
@@ -461,7 +485,7 @@ void tmpl_verify(char const *file, int line, tmpl_t const *vpt);
  *
  * Example:
  @code{.c}
-   static tmpl_t list = tmpl_initialiser_list(CURRENT_REQUEST, PAIR_LIST_REQUEST);
+   static tmpl_t list = tmpl_init_initialiser_list(CURRENT_REQUEST, PAIR_LIST_REQUEST);
    fr_cursor_t cursor;
    VALUE_PAIR *vp;
 
@@ -478,7 +502,7 @@ void tmpl_verify(char const *file, int line, tmpl_t const *vpt);
  * @see tmpl_cursor_init
  * @see tmpl_cursor_next
  */
-#define	tmpl_initialiser_list(_request, _list)\
+#define	tmpl_init_initialiser_list(_request, _list)\
 { \
 	.name = "static", \
 	.len = sizeof("static"), \
@@ -536,7 +560,8 @@ typedef enum {
 							///< found in the dictionaries, and is disallowed
 							///< because 'disallow_internal' in tmpl_rules_t
 							///< is trie.
-	ATTR_REF_ERROR_UNDEFINED_ATTRIBUTE_NOT_ALLOWED,	//!< Attribute couldn't be found in the dictionaries.
+	ATTR_REF_ERROR_UNPARSED_ATTRIBUTE_NOT_ALLOWED,	//!< Attribute couldn't be found in the dictionaries.
+	ATTR_REF_ERROR_UNQUALIFIED_ATTRIBUTE_NOT_ALLOWED,//!< Attribute must be qualified to be used here.
 	ATTR_REF_ERROR_INVALID_ATTRIBUTE_NAME,		//!< Attribute ref length is zero, or longer than
 							///< the maximum.
 	ATTR_REF_ERROR_INTERNAL_ATTRIBUTE_NOT_ALLOWED,	//!< Attribute resolved to an internal attribute
@@ -545,7 +570,9 @@ typedef enum {
 							///< to the one specified.
 	ATTR_REF_ERROR_TAGGED_ATTRIBUTE_NOT_ALLOWED,	//!< Tagged attributes not allowed here.
 	ATTR_REF_ERROR_INVALID_TAG,			//!< Invalid tag value.
-	ATTR_REF_ERROR_INVALID_ARRAY_INDEX		//!< Invalid array index.
+	ATTR_REF_ERROR_INVALID_ARRAY_INDEX,		//!< Invalid array index.
+	ATTR_REF_ERROR_NESTING_TOO_DEEP,		//!< Too many levels of nesting.
+	ATTR_REF_ERROR_MISSING_TERMINATOR		//!< Unexpected text found after attribute reference
 } attr_ref_error_t;
 
 /** Map ptr type to a boxed type
@@ -592,6 +619,8 @@ typedef enum {
 #define tmpl_aexpand_type(_ctx, _out, _type, _request, _vpt, _escape, _escape_ctx) \
 			  _tmpl_to_atype(_ctx, (void *)(_out), _request, _vpt, _escape, _escape_ctx, _type)
 
+void			tmpl_debug(tmpl_t const *vpt);
+
 VALUE_PAIR		**radius_list(REQUEST *request, pair_list_t list);
 
 RADIUS_PACKET		*radius_packet(REQUEST *request, pair_list_t list_name);
@@ -604,13 +633,20 @@ int			radius_request(REQUEST **request, request_ref_t name);
 
 size_t			radius_request_name(request_ref_t *out, char const *name, request_ref_t unknown);
 
-tmpl_t		*tmpl_init(tmpl_t *vpt, tmpl_type_t type,
-				   char const *name, ssize_t len, fr_token_t quote);
+tmpl_t		*tmpl_init_printf(tmpl_t *vpt, tmpl_type_t type, fr_token_t quote, char const *fmt, ...);
 
-tmpl_t		*tmpl_alloc(TALLOC_CTX *ctx, tmpl_type_t type, char const *name,
-				    ssize_t len, fr_token_t quote);
+tmpl_t		*tmpl_init_shallow(tmpl_t *vpt, tmpl_type_t type,
+					   fr_token_t quote, char const *name, ssize_t len);
 
-void			tmpl_set_name(tmpl_t *vpt, fr_token_t quote, char const *fmt, ...);
+tmpl_t		*tmpl_init(tmpl_t *vpt, tmpl_type_t type, fr_token_t quote, char const *name, ssize_t len);
+
+tmpl_t		*tmpl_alloc(TALLOC_CTX *ctx, tmpl_type_t type, fr_token_t quote, char const *name, ssize_t len);
+
+void			tmpl_set_name_printf(tmpl_t *vpt, fr_token_t quote, char const *fmt, ...);
+
+void			tmpl_set_name_shallow(tmpl_t *vpt, fr_token_t quote, char const *name, ssize_t len);
+
+void			tmpl_set_name(tmpl_t *vpt, fr_token_t quote, char const *name, ssize_t len);
 
 int			tmpl_afrom_value_box(TALLOC_CTX *ctx, tmpl_t **out, fr_value_box_t *data, bool steal);
 
@@ -646,21 +682,27 @@ int			tmpl_attr_afrom_list(TALLOC_CTX *ctx, tmpl_t **out, tmpl_t const *list,
 					     fr_dict_attr_t const *da, int8_t tag);
 
 ssize_t			tmpl_afrom_attr_substr(TALLOC_CTX *ctx, attr_ref_error_t *err,
-					       tmpl_t **out, char const *name, ssize_t name_len,
-					       tmpl_rules_t const *rules);
+					       tmpl_t **out, fr_sbuff_t *name,
+					       fr_sbuff_parse_rules_t const *p_rules,
+					       tmpl_rules_t const *ar_rules);
 
 ssize_t			tmpl_afrom_attr_str(TALLOC_CTX *ctx, attr_ref_error_t *err,
 					    tmpl_t **out, char const *name,
 					    tmpl_rules_t const *rules) CC_HINT(nonnull (3, 4));
 
-ssize_t			tmpl_afrom_str(TALLOC_CTX *ctx, tmpl_t **out, char const *name, size_t inlen,
-				       fr_token_t type, tmpl_rules_t const *rules, bool do_escape);
+ssize_t			tmpl_afrom_substr(TALLOC_CTX *ctx, tmpl_t **out,
+					  fr_sbuff_t *in,
+					  fr_token_t quote,
+					  fr_sbuff_parse_rules_t const *p_rules,
+					  tmpl_rules_t const *ar_rules);
+
+ssize_t			tmpl_cast_substr(fr_type_t *out, fr_sbuff_t *in);
 
 int			tmpl_cast_in_place(tmpl_t *vpt, fr_type_t type, fr_dict_attr_t const *enumv);
 
-size_t			tmpl_snprint_attr_str(size_t *need, char *out, size_t outlen, tmpl_t const *vpt);
+ssize_t			tmpl_print_attr_str(fr_sbuff_t *out, tmpl_t const *vpt);
 
-size_t			tmpl_snprint(size_t *need, char *out, size_t outlen, tmpl_t const *vpt);
+ssize_t			tmpl_print(fr_sbuff_t *out, tmpl_t const *vpt);
 
 ssize_t			_tmpl_to_type(void *out,
 				      uint8_t *buff, size_t outlen,
@@ -690,7 +732,7 @@ int			tmpl_find_or_add_vp(VALUE_PAIR **out, REQUEST *request, tmpl_t const *vpt)
 int			tmpl_unknown_attr_add(tmpl_t *vpt);
 
 int			tmpl_unparsed_attr_add(fr_dict_t *dict, tmpl_t *vpt,
-						   fr_type_t type, fr_dict_attr_flags_t const *flags);
+					       fr_type_t type, fr_dict_attr_flags_t const *flags);
 
 ssize_t			tmpl_preparse(char const **out, size_t *outlen, char const *in, size_t inlen,
 				      fr_token_t *type, char const **error,

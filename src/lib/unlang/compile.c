@@ -198,7 +198,7 @@ static bool pass2_fixup_xlat(CONF_ITEM const *ci, tmpl_t **pvpt, bool convert,
 
 	fr_assert(tmpl_is_xlat_unparsed(vpt));
 
-	slen = xlat_tokenize(vpt, &head, vpt->name, talloc_array_length(vpt->name) - 1, rules);
+	slen = xlat_tokenize(vpt, &head, &FR_SBUFF_IN(vpt->name, talloc_array_length(vpt->name) - 1), NULL, rules);
 
 	if (slen < 0) {
 		char *spaces, *text;
@@ -289,7 +289,7 @@ static bool pass2_fixup_regex(CONF_ITEM const *ci, tmpl_t *vpt, tmpl_rules_t con
 	 *	XLAT instead of a REGEX.
 	 */
 	if (strchr(vpt->name, '%')) {
-		vpt->type = TMPL_TYPE_XLAT_UNPARSED;
+		vpt->type = TMPL_TYPE_REGEX_XLAT;
 		return pass2_fixup_xlat(ci, &vpt, false, NULL, rules);
 	}
 
@@ -593,8 +593,12 @@ static bool pass2_fixup_map(fr_cond_t *c, tmpl_rules_t const *rules)
 		ssize_t slen;
 
 		fmt = talloc_typed_asprintf(map->lhs, "%%{%s}", map->lhs->name);
-		slen = tmpl_afrom_str(map, &vpt, fmt, talloc_array_length(fmt) - 1, T_DOUBLE_QUOTED_STRING,
-				      &(tmpl_rules_t){ .allow_unknown = true }, true);
+		slen = tmpl_afrom_substr(map, &vpt, &FR_SBUFF_IN(fmt, talloc_array_length(fmt) - 1),
+					 T_DOUBLE_QUOTED_STRING,
+					 NULL,
+					 &(tmpl_rules_t){
+					 	.allow_unknown = true
+					 });
 		if (slen < 0) {
 			char *spaces, *text;
 
@@ -891,7 +895,7 @@ static void unlang_dump(unlang_t *mc, int depth)
 
 		print_map:
 			for (map = g->map; map != NULL; map = map->next) {
-				map_snprint(NULL, buffer, sizeof(buffer), map);
+				map_snprint(&FR_SBUFF_OUT(buffer, sizeof(buffer)), map);
 				DEBUG("%.*s%s", depth + 1, unlang_spaces, buffer);
 			}
 
@@ -908,7 +912,7 @@ static void unlang_dump(unlang_t *mc, int depth)
 		case UNLANG_TYPE_IF:
 		case UNLANG_TYPE_ELSIF:
 			g = unlang_generic_to_group(inst);
-			cond_snprint(NULL, buffer, sizeof(buffer), g->cond);
+			cond_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), g->cond);
 			DEBUG("%.*s%s (%s) {", depth, unlang_spaces, unlang_ops[inst->type].name, buffer);
 			unlang_dump(g->children, depth + 1);
 			DEBUG("%.*s}", depth, unlang_spaces);
@@ -917,7 +921,7 @@ static void unlang_dump(unlang_t *mc, int depth)
 		case UNLANG_TYPE_SWITCH:
 		case UNLANG_TYPE_CASE:
 			g = unlang_generic_to_group(inst);
-			tmpl_snprint(NULL, buffer, sizeof(buffer), g->vpt);
+			tmpl_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), g->vpt);
 			DEBUG("%.*s%s %s {", depth, unlang_spaces, unlang_ops[inst->type].name, buffer);
 			unlang_dump(g->children, depth + 1);
 			DEBUG("%.*s}", depth, unlang_spaces);
@@ -1084,7 +1088,7 @@ int unlang_fixup_update(vp_map_t *map, UNUSED void *ctx)
 
 		TALLOC_FREE(map->rhs);
 
-		map->rhs = tmpl_alloc(map, TMPL_TYPE_NULL, NULL, 0, T_INVALID);
+		map->rhs = tmpl_alloc(map, TMPL_TYPE_NULL, T_INVALID, NULL, 0);
 	}
 
 	/*
@@ -1278,7 +1282,7 @@ static int unlang_fixup_filter(vp_map_t *map, UNUSED void *ctx)
 
 		TALLOC_FREE(map->rhs);
 
-		map->rhs = tmpl_alloc(map, TMPL_TYPE_NULL, NULL, 0, T_INVALID);
+		map->rhs = tmpl_alloc(map, TMPL_TYPE_NULL, T_INVALID, NULL, 0);
 	}
 
 	/*
@@ -1499,8 +1503,11 @@ static unlang_t *compile_map(unlang_t *parent, unlang_compile_t *unlang_ctx, CON
 		/*
 		 *	Try to parse the template.
 		 */
-		slen = tmpl_afrom_str(cs, &vpt, tmpl_str, talloc_array_length(tmpl_str) - 1, type,
-				      &parse_rules, true);
+		slen = tmpl_afrom_substr(cs, &vpt,
+					 &FR_SBUFF_IN(tmpl_str, talloc_array_length(tmpl_str) - 1),
+					 type,
+					 NULL,
+					 &parse_rules);
 		if (slen < 0) {
 			cf_log_perr(cs, "Failed parsing map");
 			return NULL;
@@ -2106,7 +2113,11 @@ static unlang_t *compile_switch(unlang_t *parent, unlang_compile_t *unlang_ctx, 
 	 *	that the data types match.
 	 */
 	type = cf_section_name2_quote(cs);
-	slen = tmpl_afrom_str(g, &g->vpt, name2, strlen(name2), type, &parse_rules, true);
+	slen = tmpl_afrom_substr(g, &g->vpt,
+				 &FR_SBUFF_IN(name2, strlen(name2)),
+				 type,
+				 NULL,
+				 &parse_rules);
 	if (slen < 0) {
 		char *spaces, *text;
 
@@ -2211,7 +2222,11 @@ static unlang_t *compile_case(unlang_t *parent, unlang_compile_t *unlang_ctx, CO
 
 		type = cf_section_name2_quote(cs);
 
-		slen = tmpl_afrom_str(cs, &vpt, name2, strlen(name2), type, &parse_rules, true);
+		slen = tmpl_afrom_substr(cs, &vpt,
+					 &FR_SBUFF_IN(name2, strlen(name2)),
+					 type,
+					 NULL,
+					 &parse_rules);
 		if (slen < 0) {
 			char *spaces, *text;
 
@@ -2336,7 +2351,11 @@ static unlang_t *compile_foreach(unlang_t *parent, unlang_compile_t *unlang_ctx,
 	 *	will fix it up.
 	 */
 	type = cf_section_name2_quote(cs);
-	slen = tmpl_afrom_str(cs, &vpt, name2, strlen(name2), type, &parse_rules, true);
+	slen = tmpl_afrom_substr(cs, &vpt,
+				 &FR_SBUFF_IN(name2, strlen(name2)),
+				 type,
+				 NULL,
+				 &parse_rules);
 	if ((slen < 0) && ((type != T_BARE_WORD) || (name2[0] != '&'))) {
 		char *spaces, *text;
 
@@ -2478,7 +2497,11 @@ static unlang_t *compile_tmpl(unlang_t *parent,
 
 	(void) compile_action_defaults(c, unlang_ctx);
 
-	slen = tmpl_afrom_str(ut, &vpt, p, talloc_array_length(p) - 1, T_DOUBLE_QUOTED_STRING, unlang_ctx->rules, true);
+	slen = tmpl_afrom_substr(ut, &vpt,
+				 &FR_SBUFF_IN(p, talloc_array_length(p) - 1),
+				 T_DOUBLE_QUOTED_STRING,
+				 NULL,
+				 unlang_ctx->rules);
 	if (slen <= 0) {
 		char *spaces, *text;
 
@@ -2500,9 +2523,9 @@ static unlang_t *compile_tmpl(unlang_t *parent,
 	 *	Ensure that the expansions are precompiled.
 	 */
 	if (ut->inline_exec) {
-		slen = xlat_tokenize_argv(vpt, &head, vpt->name, talloc_array_length(vpt->name) - 1, unlang_ctx->rules);
+		slen = xlat_tokenize_argv(vpt, &head, &FR_SBUFF_IN(vpt->name, talloc_array_length(vpt->name) - 1), NULL, unlang_ctx->rules);
 	} else {
-		slen = xlat_tokenize(vpt, &head, vpt->name, talloc_array_length(vpt->name) - 1, unlang_ctx->rules);
+		slen = xlat_tokenize(vpt, &head, &FR_SBUFF_IN(vpt->name, talloc_array_length(vpt->name) - 1), NULL, unlang_ctx->rules);
 	}
 	if (slen <= 0) {
 		p = vpt->name;
@@ -2782,7 +2805,11 @@ static unlang_t *compile_load_balance_subsection(unlang_t *parent, unlang_compil
 		 *	defined by now.
 		 */
 		type = cf_section_name2_quote(cs);
-		slen = tmpl_afrom_str(g, &g->vpt, name2, strlen(name2), type, &parse_rules, true);
+		slen = tmpl_afrom_substr(g, &g->vpt,
+					 &FR_SBUFF_IN(name2, strlen(name2)),
+					 type,
+					 NULL,
+					 &parse_rules);
 		if (slen < 0) {
 			char *spaces, *text;
 

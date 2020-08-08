@@ -20,13 +20,15 @@
  * @file xlat_tokenize.c
  * @brief String expansion ("translation").  Tokenizes xlat expansion strings.
  *
- * @copyright 2000,2006 The FreeRADIUS server project
  * @copyright 2000 Alan DeKok (aland@freeradius.org)
+ * @copyright 2000,2006 The FreeRADIUS server project
+ * @copyright 2017-2020 Arran Cudbard-Bell (a.cudbardb@freeradius.org)
  */
 
 RCSID("$Id$")
 
 #include <freeradius-devel/util/debug.h>
+#include <freeradius-devel/util/sbuff.h>
 #include <freeradius-devel/server/request.h>
 #include <freeradius-devel/server/regex.h>
 #include <freeradius-devel/unlang/xlat_priv.h>
@@ -35,17 +37,45 @@ RCSID("$Id$")
 
 #undef XLAT_DEBUG
 #ifdef DEBUG_XLAT
-#  define XLAT_DEBUG DEBUG3
+#  define XLAT_DEBUG(_fmt, ...)		DEBUG3("%s[%i] "_fmt, __FILE__, __LINE__, ##__VA_ARGS__)
 #else
 #  define XLAT_DEBUG(...)
 #endif
+
+/** These rules apply to literals and function arguments inside of an expansion
+ *
+ */
+static fr_sbuff_escape_rules_t const xlat_escape = {
+	.chr = '\\',
+	.subs = {
+		['a'] = '\a',
+		['b'] = '\b',
+		['e'] = '\\',
+		['n'] = '\n',
+		['r'] = '\r',
+		['t'] = '\t',
+		['v'] = '\v',
+		['\\'] = '\\',
+		['%'] = '%',	/* Expansion begin */
+		[':'] = ':',	/* Alternation begin */
+		['}'] = '}'	/* Expansion end */
+	},
+	.do_hex = true,
+	.do_oct = true
+};
+
+/** Wrap the escapes in a structure to allow them to be passed to xlat_literal
+ *
+ */
+static fr_sbuff_parse_rules_t const xlat_rules = {
+	.escapes = &xlat_escape
+};
 
 /** Allocate an xlat node
  *
  * @param[in] ctx	to allocate node in.
  * @param[in] type	of the node.
  * @param[in] in	original input string.
- * @param[in] inlen	Portion of the input string that this node represents.
  * @return A new xlat node.
  */
 static inline xlat_exp_t *xlat_exp_alloc(TALLOC_CTX *ctx, xlat_type_t type, char const *in, size_t inlen)
@@ -57,6 +87,51 @@ static inline xlat_exp_t *xlat_exp_alloc(TALLOC_CTX *ctx, xlat_type_t type, char
 	if (in) node->fmt = talloc_bstrndup(node, in, inlen);
 
 	return node;
+}
+
+/** Allocate an xlat node with no name, and no type set
+ *
+ * @param[in] ctx	to allocate node in.
+ * @return A new xlat node.
+ */
+static inline xlat_exp_t *xlat_exp_alloc_null(TALLOC_CTX *ctx)
+{
+	xlat_exp_t *node;
+
+	MEM(node = talloc_zero(ctx, xlat_exp_t));
+	return node;
+}
+
+/** Set the type of an xlat node
+ *
+ * @param[in] node	to set type for.
+ * @param[in] type	to set.
+ */
+static inline void xlat_exp_set_type(xlat_exp_t *node, xlat_type_t type)
+{
+	node->type = type;
+}
+
+/** Set the format string for an xlat node
+ *
+ * @param[in] node	to set fmt for.
+ * @param[in] fmt	talloced buffer to set as the fmt string.
+ */
+static inline void xlat_exp_set_name_buffer(xlat_exp_t *node, char const *fmt)
+{
+	if (node->fmt) talloc_const_free(node->fmt);
+	node->fmt = talloc_bstrdup(node, fmt);
+}
+
+/** Set the format string for an xlat node
+ *
+ * @param[in] node	to set fmt for.
+ * @param[in] fmt	talloced buffer to set as the fmt string.
+ */
+static inline void xlat_exp_set_name_buffer_shallow(xlat_exp_t *node, char *fmt)
+{
+	if (node->fmt) talloc_const_free(node->fmt);
+	node->fmt = fmt;
 }
 
 /** Try to convert an xlat to a tmpl for efficiency
@@ -79,7 +154,7 @@ tmpl_t *xlat_to_tmpl_attr(TALLOC_CTX *ctx, xlat_exp_t *node)
 	 */
 	if ((tmpl_num(node->attr) == NUM_COUNT) || (tmpl_num(node->attr) == NUM_ALL)) return NULL;
 
-	vpt = tmpl_alloc(ctx, TMPL_TYPE_ATTR, node->fmt, talloc_array_length(node->fmt) - 1, T_BARE_WORD);
+	vpt = tmpl_alloc(ctx, TMPL_TYPE_ATTR, T_BARE_WORD, node->fmt, talloc_array_length(node->fmt) - 1);
 	if (!vpt) return NULL;
 
 	tmpl_attr_copy(vpt, node->attr);
@@ -104,91 +179,69 @@ xlat_exp_t *xlat_from_tmpl_attr(TALLOC_CTX *ctx, tmpl_t *vpt)
 	if (!tmpl_is_attr(vpt)) return NULL;
 
 	node = xlat_exp_alloc(ctx, XLAT_ATTRIBUTE, vpt->name, vpt->len);
-	node->attr = tmpl_alloc(node, TMPL_TYPE_ATTR, node->fmt, talloc_array_length(node->fmt) - 1, T_BARE_WORD);
+	node->attr = tmpl_alloc(node, TMPL_TYPE_ATTR, T_BARE_WORD, node->fmt, talloc_array_length(node->fmt) - 1);
 	tmpl_attr_copy(node->attr, vpt);
 
 	return node;
 }
 
-static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-				       tmpl_rules_t const *rules);
-static ssize_t xlat_tokenize_literal(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-				     bool brace, tmpl_rules_t const *rules);
+static int xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+				   tmpl_rules_t const *ar_rules);
 
-static ssize_t xlat_tokenize_alternation(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-					 tmpl_rules_t const *rules)
+static int xlat_tokenize_literal(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in, bool brace,
+				 fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules);
+
+static inline int xlat_tokenize_alternation(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+					    tmpl_rules_t const *ar_rules)
 {
-	ssize_t		slen;
-	char const	*p = in;
 	xlat_exp_t	*node;
 
-	fr_assert(in[0] == '%');
-	fr_assert(in[1] == '{');
-	fr_assert(in[2] == '%');
-	fr_assert(in[3] == '{');
+	XLAT_DEBUG("ALTERNATE <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 
-	XLAT_DEBUG("ALTERNATE <-- %s", in);
-
-	node = xlat_exp_alloc(ctx, XLAT_ALTERNATE, NULL, 0);
-	p += 2;
-	slen = xlat_tokenize_expansion(node, &node->child, p, in + inlen - p, rules);
-	if (slen <= 0) {
+	node = xlat_exp_alloc_null(ctx);
+	xlat_exp_set_type(node, XLAT_ALTERNATE);
+	if (xlat_tokenize_expansion(node, &node->child, in, ar_rules) < 0) {
+	error:
+		*head = NULL;
 		talloc_free(node);
-		return slen - (p - in);
+		return -1;
 	}
-	p += slen;
 
-	if (p[0] != ':') {
-		talloc_free(node);
-		fr_strerror_printf("Expected ':' after first expansion, got '%pV'",
-				   fr_box_strvalue_len(p, 1));
-		return -(p - in);
+	if (!fr_sbuff_adv_past_str_literal(in, ":-")) {
+		fr_strerror_printf("Expected ':-' after first expansion");
+		goto error;
 	}
-	p++;
-
-	if (p[0] != '-') {
-		talloc_free(node);
-		fr_strerror_printf("Expected '-' after ':'");
-		return -(p - in);
-	}
-	p++;
 
 	/*
 	 *	Allow the RHS to be empty as a special case.
 	 */
-	switch (*p) {
-	case '}':
+	if (fr_sbuff_next_if_char(in, '}')) {
 		node->alternate = xlat_exp_alloc(node, XLAT_LITERAL, "", 0);
 		node->async_safe = node->child->async_safe;
 		*head = node;
-		return (p + 1) - in;
-
-	case '\0':
-		fr_strerror_printf("No matching closing brace");
-		talloc_free(node);
-		return -2;
+		return 0;
 	}
 
 	/*
 	 *	Parse the alternate expansion.
 	 */
-	slen = xlat_tokenize_literal(node, &node->alternate, p, in + inlen - p, true, rules);
-	if (slen <= 0) {
-		talloc_free(node);
-		return slen - (p - in);
-	}
+	if (xlat_tokenize_literal(node, &node->alternate, in, true, &xlat_rules, ar_rules) < 0) goto error;
 
 	if (!node->alternate) {
 		talloc_free(node);
 		fr_strerror_printf("Empty expansion is invalid");
-		return -(p - in);
+		goto error;
 	}
-	p += slen;
+
+	if (!fr_sbuff_next_if_char(in, '}')) {
+		fr_strerror_printf("Missing closing brace");
+		goto error;
+	}
 
 	node->async_safe = (node->child->async_safe && node->alternate->async_safe);
 	*head = node;
 
-	return p - in;
+	return 0;
 }
 
 #ifdef HAVE_REGEX
@@ -198,62 +251,51 @@ static ssize_t xlat_tokenize_alternation(TALLOC_CTX *ctx, xlat_exp_t **head, cha
  * @verbatim %{<num>} @endverbatim
  *
  */
-static inline ssize_t xlat_tokenize_regex(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen)
+static inline int xlat_tokenize_regex(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in)
 {
-	unsigned long	num;
-	char const	*p, *end;
-	xlat_exp_t	*node;
+	uint8_t			num;
+	xlat_exp_t		*node;
+	fr_sbuff_parse_error_t	err;
+	fr_sbuff_marker_t	m_s;
 
-	/*
-	 *	Must be at least %{0} in length
-	 */
-	if (inlen < 4) return 0;
+	XLAT_DEBUG("REGEX <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 
-	fr_assert(in[0] == '%');
-	fr_assert(in[1] == '{');
+	fr_sbuff_marker(&m_s, in);
 
-	p = in + 2;
-	end = in + inlen;
-
-	if (*p == '}') {
-	fail:
+	fr_sbuff_out(&err, &num, in);
+	if (err != FR_SBUFF_PARSE_OK) {
+	invalid_ref:
 		fr_strerror_printf("Invalid regex reference.  Must be in range 0-%u", REQUEST_MAX_REGEX);
-		return -(p - in);		/* error */
-	}
-
-	num = 0;
-	while (p < end) {
-		if (*p == '}') break;
-
-		/*
-		 *	We allow numbers followed by letters for attributes such as 3GPP-...
-		 */
-		if (!((p[0] >= '0') && (p[0] <= '9'))) return 0;
-		num *= 10;
-		num += p[0] - '0';
-		p++;
-
-		if (num > REQUEST_MAX_REGEX) {
-			p = in + 2;
-			goto fail;
-		};
-	}
-
-	if (*p != '}') {
-		fr_strerror_printf("No matching closing brace");
+		fr_sbuff_marker_release(&m_s);
 		return -1;
 	}
 
-	XLAT_DEBUG("REGEX <-- %pV", fr_box_strvalue_len(in, (p - in) + 1));
+	if (num > REQUEST_MAX_REGEX) {
+		fr_sbuff_set(in, &m_s);
+		goto invalid_ref;
+	}
 
-	node = xlat_exp_alloc(ctx, XLAT_REGEX, p, p - (in + 2));
+	if (!fr_sbuff_is_char(in, '}')) {
+		if (!fr_sbuff_remaining(in)) {
+			fr_strerror_printf("Missing closing brace");
+			fr_sbuff_marker_release(&m_s);
+			return -1;
+		}
+		fr_sbuff_set(in, &m_s);
+		fr_sbuff_marker_release(&m_s);
+		return 1;
+	}
+
+	node = xlat_exp_alloc(ctx, XLAT_REGEX, fr_sbuff_current(&m_s), fr_sbuff_behind(&m_s));
 	node->regex_index = num;
 	node->async_safe = true;
+
+	fr_sbuff_marker_release(&m_s);
+	fr_sbuff_next(in);	/* Skip '}' */
+
 	*head = node;
 
-	p++;	/* Skip over '}' */
-
-	return p - in;
+	return 0;
 }
 #endif
 
@@ -263,84 +305,88 @@ static inline ssize_t xlat_tokenize_regex(TALLOC_CTX *ctx, xlat_exp_t **head, ch
  * @verbatim %{<func>:<arguments} @endverbatim
  *
  */
-static inline ssize_t xlat_tokenize_function(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-					     tmpl_rules_t const *rules)
+static inline int xlat_tokenize_function(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+					 tmpl_rules_t const *rules)
 {
-	ssize_t		slen;
-	char const	*p, *q, *end;
-	xlat_exp_t	*node;
-	xlat_t		*func;
+	xlat_exp_t		*node;
+	xlat_t			*func;
+	fr_sbuff_marker_t	m_s;
 
-	if (inlen < 2) return 0;
+	/*
+	 *	Special characters, spaces, etc. cannot be
+	 *	module names.
+	 */
+	static bool const	func_chars[UINT8_MAX + 1] = {
+					SBUFF_CHAR_CLASS_ALPHA_NUM,
+					['.'] = true, ['-'] = true, ['_'] = true,
+				};
 
-	fr_assert(in[0] == '%');
-	fr_assert(in[1] == '{');
-
-	p = in + 2;
-	end = in + inlen;
+	XLAT_DEBUG("FUNC <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 
 	/*
 	 *	%{module:args}
 	 */
-	for (q = p; q < end; q++) {
-		if (*q == ':') break;
+	fr_sbuff_marker(&m_s, in);
+	fr_sbuff_adv_past_allowed(in, SIZE_MAX, func_chars);
 
-		/*
-		 *	Special characters, spaces, etc. cannot be
-		 *	module names.
-		 */
-		if ((*q < '0') && (*q != '.') && (*q != '-')) return 0;
+	if (!fr_sbuff_is_char(in, ':')) {
+	not_a_function:
+		fr_sbuff_set(in, &m_s);		/* backtrack */
+		fr_sbuff_marker_release(&m_s);
+		return 1;
 	}
 
-	if (q >= end) return 0;
-
-	func = xlat_func_find(p, q - p);
-	if (!func) return 0;
+	func = xlat_func_find(fr_sbuff_current(&m_s), fr_sbuff_behind(&m_s));
+	if (!func) goto not_a_function;
 
 	/*
 	 *	Allocate a node to hold the function
 	 */
-	node = xlat_exp_alloc(ctx, XLAT_FUNC, p, q - p);
+	node = xlat_exp_alloc(ctx, XLAT_FUNC, fr_sbuff_current(&m_s), fr_sbuff_behind(&m_s));
 	node->xlat = func;
 
-	p = q + 1;
-	XLAT_DEBUG("FUNC <-- %s ... %s", node->fmt, p);
+	fr_sbuff_next(in);			/* Skip the ':' */
+	XLAT_DEBUG("FUNC-ARGS <-- %s ... %pV",
+		   node->fmt, fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
+
+	fr_sbuff_marker_release(&m_s);
 
 	/*
 	 *	Now parse the child nodes that form the
 	 *	function's arguments.
 	 */
-	slen = xlat_tokenize_literal(node, &node->child, p, in + inlen - p, true, rules);
-	if (slen < 0) {
+	if (xlat_tokenize_literal(node, &node->child, in, true, &xlat_rules, rules) < 0) {
+	error:
+		*head = NULL;
 		talloc_free(node);
-		return slen - (p - in);	/* error */
+		return -1;
 	}
 
-	p += slen;
-	if (*(p - 1) != '}') {	/* @todo: xlat_tokenize_literal should not consume the closing brace */
-		fr_strerror_printf("No matching closing brace");
-		talloc_free(node);
-		return -1;						/* error at the second character of format string */
+	if (!fr_sbuff_next_if_char(in, '}')) {
+		fr_strerror_printf("Missing closing brace");
+		goto error;
 	}
 
 	node->async_safe = (func->async_safe && (!node->child || node->child->async_safe));
 	*head = node;
 
-	return p - in;
+	return 0;
 }
 
 /** Parse an attribute ref or a virtual attribute
  *
  */
-static inline ssize_t xlat_tokenize_attribute(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-					      tmpl_rules_t const *rules)
+static inline int xlat_tokenize_attribute(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+					  fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules)
 {
 	ssize_t			slen;
-	char const		*p, *q;
 	attr_ref_error_t	err;
 	tmpl_t		*vpt = NULL;
 	xlat_exp_t		*node;
 	xlat_t			*func;
+	fr_sbuff_marker_t	m_s;
+
+	XLAT_DEBUG("ATTRIBUTE <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 
 	/*
 	 *	We need a local copy as we always allow unknowns.
@@ -349,101 +395,124 @@ static inline ssize_t xlat_tokenize_attribute(TALLOC_CTX *ctx, xlat_exp_t **head
 	 *	and instead are "virtual" attributes like
 	 *	Foreach-Variable-N.
 	 */
-	tmpl_rules_t our_rules;
+	tmpl_rules_t		 our_ar_rules;
 
-	if (inlen < 2) return 0;
-
-	fr_assert(in[0] == '%');
-	fr_assert(in[1] == '{');
-
-	if (rules) {
-		memcpy(&our_rules, rules, sizeof(our_rules));
+	if (ar_rules) {
+		memcpy(&our_ar_rules, ar_rules, sizeof(our_ar_rules));
 	} else {
-		memset(&our_rules, 0, sizeof(our_rules));
+		memset(&our_ar_rules, 0, sizeof(our_ar_rules));
 	}
 
-	p = in + 2;
+	our_ar_rules.allow_unparsed = true;		/* So we can check for virtual attributes later */
+  	our_ar_rules.prefix = TMPL_ATTR_REF_PREFIX_NO;	/* Must be NO to stop %{&User-Name} */
 
-	our_rules.allow_unparsed = true;		/* So we can check for virtual attributes later */
-  	our_rules.prefix = TMPL_ATTR_REF_PREFIX_NO;	/* Must be NO to stop %{&User-Name} */
-	slen = tmpl_afrom_attr_substr(NULL, &err, &vpt, p, inlen - 2, &our_rules);
+	fr_sbuff_marker(&m_s, in);
+
+	MEM(node = xlat_exp_alloc_null(ctx));
+	slen = tmpl_afrom_attr_substr(node, &err, &vpt, in, p_rules, &our_ar_rules);
 	if (slen <= 0) {
+		fr_sbuff_advance(in, slen * -1);
+
 		/*
 		 *	If the parse error occurred before the ':'
 		 *	then the error is changed to 'Unknown module',
 		 *	as it was more likely to be a bad module name,
 		 *	than a request qualifier.
 		 */
-		if (err == ATTR_REF_ERROR_INVALID_LIST_QUALIFIER) {
+		if ((err == ATTR_REF_ERROR_MISSING_TERMINATOR) && fr_sbuff_is_char(in, ':')) {
 			fr_strerror_printf("Unknown expansion function or invalid list qualifier");
+			fr_sbuff_set(in, &m_s);
 		}
-		return slen - (p - in);		/* error somewhere after second character */
+	error:
+		*head = NULL;
+		fr_sbuff_marker_release(&m_s);
+		talloc_free(node);
+		return -1;
 	}
-	q = p + slen;
-
-	if (*q != '}') {
-		fr_strerror_printf("No matching closing brace");
-		talloc_free(vpt);
-		return -1;						/* error @ second character of format string */
-	}
-
-	q++;	/* Skip over the closing brace */
 
 	/*
 	 *	Might be a virtual XLAT attribute, which is identical
 	 *	to a normal function but called without an argument
 	 *	list.
 	 */
-	if (tmpl_is_attr_unparsed(vpt)) {
+	switch (vpt->type) {
+	case TMPL_TYPE_ATTR_UNPARSED:
 		func = xlat_func_find(tmpl_attr_unparsed(vpt), -1);
 		if (func && (func->type == XLAT_FUNC_SYNC)) {
-			node = xlat_exp_alloc(ctx, XLAT_VIRTUAL,
-					      tmpl_attr_unparsed(vpt), talloc_array_length(tmpl_attr_unparsed(vpt)) - 1);
+			xlat_exp_set_type(node, XLAT_VIRTUAL);
+			xlat_exp_set_name_buffer(node, tmpl_attr_unparsed(vpt));
 			talloc_free(vpt);	/* Free the tmpl, we don't need it */
 
-			XLAT_DEBUG("VIRTUAL <-- %s", node->fmt);
+			XLAT_DEBUG("VIRTUAL <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 			node->xlat = func;
 			node->async_safe = func->async_safe;
-			*head = node;
 
-			return q - in;
+			if (!fr_sbuff_next_if_char(in, '}')) {
+				fr_strerror_printf("Missing closing brace");
+				goto error;
+			}
+
+			goto done;
 		}
-		talloc_free(vpt);
 
-		fr_strerror_printf("Unknown attribute");
-		return -2;						/* error @ third character of format string */
+		if (!ar_rules || !ar_rules->allow_unparsed) {
+			talloc_free(vpt);
+
+			fr_strerror_printf("Unknown attribute");
+			fr_sbuff_set(in, &m_s);		/* Error at the start of the attribute */
+			goto error;
+		}
+		FALL_THROUGH;
+
+	default:
+		xlat_exp_set_name_buffer(node, vpt->name);
+		xlat_exp_set_type(node, XLAT_ATTRIBUTE);
+		break;
 	}
 
-	node = xlat_exp_alloc(ctx, XLAT_ATTRIBUTE, vpt->name, vpt->len);
-	node->attr = talloc_steal(node, vpt);
-	node->async_safe = true; /* attribute expansions are always async-safe */
-	*head = node;
+	if (!fr_sbuff_next_if_char(in, '}')) {
+		fr_strerror_printf("Missing closing brace");
+		goto error;
+	}
 
-	return q - in;
+	node->attr = vpt;
+	node->async_safe = true;		/* attribute expansions are always async-safe */
+
+done:
+	*head = node;
+	fr_sbuff_marker_release(&m_s);
+	return 0;
 }
 
-static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-				       tmpl_rules_t const *rules)
+static int xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in, tmpl_rules_t const *ar_rules)
 {
-	ssize_t		slen;
-	char const	*p = in, *q, *end;
+	size_t			len;
+	fr_sbuff_marker_t	s_m;
+	char			hint;
+	int			ret;
+	fr_sbuff_term_t		hint_tokens = FR_SBUFF_TERMS(
+					L(" "),		/* First special token is a ' ' - Likely a syntax error */
+					L(":"),		/* First special token is a ':' i.e. '%{func:' */
+					L("["),		/* First special token is a '[' i.e. '%{attr[<idx>]}' */
+					L("}")		/* First special token is a '}' i.e. '%{<attrref>}' */
+				);
 
-	XLAT_DEBUG("EXPANSION <-- %s", in);
+	fr_sbuff_parse_rules_t	attr_p_rules = {
+					.escapes = &xlat_escape,
+					.terminals = &FR_SBUFF_TERM("}")
+				};
 
-	if (inlen < 2) return 0;
-
-	fr_assert(in[0] == '%');
-	fr_assert(in[1] == '{');
+	XLAT_DEBUG("EXPANSION <-- %pV", fr_box_strvalue_len(fr_sbuff_current(in), fr_sbuff_remaining(in)));
 
 	/*
-	 *	%{%{...}:-bar}
+	 *	%{...}:-bar}
 	 */
-	if ((in[2] == '%') && (in[3] == '{')) return xlat_tokenize_alternation(ctx, head, in, inlen, rules);
+	if (fr_sbuff_adv_past_str_literal(in, "%{")) return xlat_tokenize_alternation(ctx, head, in, ar_rules);
 
 	/*
-	 *	%{:-bar}
+	 *	:-bar}
 	 */
-	if ((in[2] == ':') && (in[3] == '-')) {
+	if (fr_sbuff_is_str_literal(in, ":-")) {
 		fr_strerror_printf("First item in alternation cannot be empty");
 		return -2;
 	}
@@ -452,9 +521,9 @@ static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char 
 	/*
 	 *	Handle regex's %{<num>} specially.
 	 */
-	if (isdigit(in[2])) {
-		slen = xlat_tokenize_regex(ctx, head, in, inlen);
-		if (slen != 0) return slen;	/* If slen == 0 means this wasn't a regex */
+	if (fr_sbuff_is_digit(in)) {
+		ret = xlat_tokenize_regex(ctx, head, in);
+		if (ret <= 0) return ret;
 	}
 #endif /* HAVE_REGEX */
 
@@ -470,40 +539,39 @@ static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char 
 	 */
 
 	/*
-	 *	This is for efficiency, so we don't search for an xlat,
-	 *	when what's being referenced is obviously an attribute.
-	 */
-	p = in;
-	end = in + inlen;
-
-	for (q = p; (q < end) && *q; q++) {
-		if (*q == ':') break;			/* First special token is a ':' i.e. '%{func:' */
-
-		if (isspace((int) *q)) break;		/* First special token is a ' ' - Likely a syntax error */
-
-		if (*q == '[') break;			/* First special token is a '[' i.e. '%{attr[<idx>]}' */
-
-		if (*q == '}') break;			/* First special token is a '}' i.e. '%{<attrref>}' */
-	}
-
-	XLAT_DEBUG("EXPANSION HINT TOKEN '%c'", *q);
-
-	/*
 	 *	Check for empty expressions %{} %{: %{[
 	 */
-	if (q == (p + 2)) {
-		switch (*q) {
+	fr_sbuff_marker(&s_m, in);
+	len = fr_sbuff_adv_until(in, SIZE_MAX, &hint_tokens, '\0');
+
+	/*
+	 *      This means the end of a string not containing any of the other
+	 *	tokens was reached.
+	 *
+	 *	e.g. '%{myfirstxlat'
+	 */
+	if (!fr_sbuff_remaining(in)) {
+		fr_strerror_printf("Missing closing brace");
+		fr_sbuff_marker_release(&s_m);
+		return -1;
+	}
+
+	hint = *fr_sbuff_current(in);
+
+	XLAT_DEBUG("EXPANSION HINT TOKEN '%c'", hint);
+	if (len == 0) {
+		switch (hint) {
 		case '}':
 			fr_strerror_printf("Empty expression is invalid");
-			return -2;				/* error @ third character of format string */
+			return -1;
 
 		case ':':
 			fr_strerror_printf("Missing expansion function or list qualifier");
-			return -2;
+			return -1;
 
 		case '[':
 			fr_strerror_printf("Missing attribute name");
-			return -2;
+			return -1;
 
 		default:
 			break;
@@ -515,11 +583,18 @@ static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char 
 	 *	- An xlat function %{<func>:<args}
 	 *	- An attribute reference with a list separator %{<list>:<attr>}
 	 */
-	switch (*q) {
+	switch (hint) {
 	case ':':
-		slen = xlat_tokenize_function(ctx, head, in, inlen, rules);
-		if (slen != 0) return slen;
-		FALL_THROUGH;
+	{
+		fr_sbuff_set(in, &s_m);		/* backtrack */
+		fr_sbuff_marker_release(&s_m);
+
+		ret = xlat_tokenize_function(ctx, head, in, ar_rules);
+		if (ret <= 0) return ret;
+
+		if (xlat_tokenize_attribute(ctx, head, in, &attr_p_rules, ar_rules) < 0) return -1;
+	}
+		break;
 
 	/*
 	 *	Hint token is a:
@@ -528,24 +603,11 @@ static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char 
 	 */
 	case '}':
 	case '[':
-		slen = xlat_tokenize_attribute(ctx, head, in, inlen, rules);
-		if (slen < 0) return slen;
-		fr_assert(slen != 0);
+		fr_sbuff_set(in, &s_m);		/* backtrack */
+		fr_sbuff_marker_release(&s_m);
 
-		p += slen;
+		if (xlat_tokenize_attribute(ctx, head, in, &attr_p_rules, ar_rules) < 0) return -1;
 		break;
-
-	/*
-	 *	Hint token is a '\0'
-	 *
-	 *      This means the end of a string not containing any of the other
-	 *	tokens was reached.
-	 *
-	 *	e.g. '%{myfirstxlat'
-	 */
-	case '\0':
-		fr_strerror_printf("No matching closing brace");
-		return -1;					/* error @ second character of format string */
 
 	/*
 	 *	Hint token was whitespace
@@ -554,371 +616,355 @@ static ssize_t xlat_tokenize_expansion(TALLOC_CTX *ctx, xlat_exp_t **head, char 
 	 */
 	default:
 		/*
-		 *	Box is so we get \t \n etc..
+		 *	Box print is so we get \t \n etc..
 		 */
-		fr_strerror_printf("Invalid char '%pV' in expression", fr_box_strvalue_len(q, 1));
-		return -(q - in);
+		fr_strerror_printf("Invalid char '%pV' in expression", fr_box_strvalue_len(fr_sbuff_current(in), 1));
+		return -1;
 	}
 
-	return (p - in);
+	return 0;
 }
 
-
-static ssize_t xlat_tokenize_literal(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-				     bool brace, tmpl_rules_t const *rules)
-{
-	char const	*p, *end;
-	xlat_exp_t	*node;
-	char		*start;
-
-	if (!*in) return 0;
-
-	XLAT_DEBUG("LITERAL <-- %s", in);
-
-	node = talloc_zero(ctx, xlat_exp_t);
-	node->fmt = start = talloc_bstrndup(node, in, inlen);
-	node->len = 0;
-	node->type = XLAT_LITERAL;
-
-	p = in;
-	end = in + inlen;
-
-	while (p < end) {
-		if (*p == '\\') {
-			if (((p + 1) >= end) || !p[1]) {
-				talloc_free(node);
-				fr_strerror_printf("Invalid escape at end of string");
-				return -(p - in);
-			}
-
-			p += 2;
-			node->len += 2;
-			continue;
-		}
-
-		if ((p[0] == '%') && (p + 1) >= end) goto invalid_variable;
-
-		/*
-		 *	Process the expansion.  Which should be at least %{0} in length
-		 */
-		if ((p[0] == '%') && (p[1] == '{')) {
-			ssize_t slen;
-
-			XLAT_DEBUG("EXPANSION-2 <-- %s", node->fmt);
-
-			slen = xlat_tokenize_expansion(node, &node->next, p, end - p, rules);
-			if (slen <= 0) {
-				talloc_free(node);
-				return slen - (p - in);
-			}
-			p += slen;
-
-			fr_assert(node->next != NULL);
-
-			/*
-			 *	Short-circuit the recursive call.
-			 *	This saves another function call and
-			 *	memory allocation.
-			 */
-			if (!*p || (p >= end)) break;
-
-			/*
-			 *	"foo %{User-Name} bar"
-			 *	LITERAL		"foo "
-			 *	EXPANSION	User-Name
-			 *	LITERAL		" bar"
-			 */
-			slen = xlat_tokenize_literal(node->next, &(node->next->next), p, end - p, brace, rules);
-			fr_assert(slen != 0);
-			if (slen < 0) {
-				talloc_free(node);
-				return slen - (p - in);
-			}
-
-			brace = false; /* it was found above, or else the above code errored out */
-			p += slen;
-			break;	/* stop processing the string */
-		}
-
-		/*
-		 *	Check for valid single-character expansions.
-		 */
-		if (p[0] == '%') {
-			ssize_t		slen;
-			xlat_exp_t	*next;
-
-			if (!p[1] || !strchr("%}cdlmnsetCDGHIMSTYv", p[1])) {
-			invalid_variable:
-				talloc_free(node);
-				fr_strerror_printf("Invalid variable expansion");
-				p++;
-				return -(p - in);
-			}
-
-			next = talloc_zero(node, xlat_exp_t);
-			next->len = 1;
-
-			switch (p[1]) {
-			case '%':
-			case '}':
-				next->fmt = talloc_bstrndup(next, p + 1, 1);
-
-				XLAT_DEBUG("LITERAL-ESCAPED <-- %s", next->fmt);
-				next->type = XLAT_LITERAL;
-				break;
-
-			default:
-				next->fmt = p + 1;
-
-				XLAT_DEBUG("PERCENT <-- %c", *next->fmt);
-				next->type = XLAT_ONE_LETTER;
-				break;
-			}
-
-			node->next = next;
-			p += 2;
-
-			if (!*p || (p >= end)) break;
-
-			/*
-			 *	And recurse.
-			 */
-			slen = xlat_tokenize_literal(node->next, &(node->next->next), p, end - p, brace, rules);
-			fr_assert(slen != 0);
-			if (slen < 0) {
-				talloc_free(node);
-				return slen - (p - in);
-			}
-
-			brace = false; /* it was found above, or else the above code errored out */
-			p += slen;
-			break;	/* stop processing the string */
-		}
-
-		/*
-		 *	If required, eat the brace.
-		 */
-		if (brace && (*p == '}')) {
-			brace = false;
-			p++;
-			break;
-		}
-
-		p++;
-		node->len++;
-	}
-
-	/*
-	 *	We were told to look for a brace, but we ran off of
-	 *	the end of the string before we found one.
-	 */
-	if (brace) {
-		fr_strerror_printf("Missing closing brace at end of string");
-		talloc_free(node);
-		return -(p - in);
-	}
-
-	/*
-	 *	Squash zero-width literals
-	 */
-	if (node->len <= 0) {
-		(void) talloc_steal(ctx, node->next);
-		*head = node->next;
-		talloc_free(node);
-		return p - in;
-	}
-
-	node->async_safe = true; /* literals are always true */
-	*head = node;
-
-	/*
-	 *	Shrink the buffer to the right size
-	 */
-	MEM(start = talloc_bstr_realloc(ctx, start, node->len));
-	node->fmt = start;
-
-	return p - in;
-}
-
-
-/** skip xlat expansions, included embedded strings and nested xlats.
+/** Parse an xlat literal i.e. a non-expansion or non-function
  *
+ * When this function is being used outside of an xlat expansion, i.e. on a string
+ * which contains one or more xlat expansions, it uses the terminal grammar and
+ * escaping rules of that string type.
+ *
+ * Which this function is being used inside of an xlat expansion, it uses xlat specific
+ * terminal grammar and escaping rules.
+ *
+ * This allows us to be smart about processing quotes within the expansions themselves.
  */
-static ssize_t skip_xlat(char const *start, char const *end)
+static int xlat_tokenize_literal(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in, bool brace,
+				 fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules)
 {
-	char const *p = start + 2;
-	ssize_t slen;
+	TALLOC_CTX			*our_ctx = ctx;
+	xlat_exp_t			*node = NULL;
+	size_t				len;
+	fr_sbuff_term_t			expansions = FR_SBUFF_TERMS(
+						L("%C"),
+						L("%D"),
+						L("%G"),
+						L("%H"),
+						L("%I"),
+						L("%M"),
+						L("%S"),
+						L("%T"),
+						L("%Y"),
+						L("%c"),
+						L("%d"),
+						L("%e"),
+						L("%l"),
+						L("%m"),
+						L("%n"),
+						L("%s"),
+						L("%t"),
+						L("%v"),
+						L("%{"),
+						L("}")
+					);
+	fr_sbuff_term_t			*tokens;
+	fr_cursor_t			cursor;
+	fr_sbuff_escape_rules_t	const	*escapes;
 
-	while (p < end) {
-		if (*p == '}') {
-			p++;
-			return p - start;
+	*head = NULL;
+
+	fr_cursor_init(&cursor, head);
+	escapes = p_rules ? p_rules->escapes : NULL;
+	tokens = p_rules && p_rules->terminals ?
+			fr_sbuff_terminals_amerge(NULL, p_rules->terminals, &expansions) : &expansions;
+
+	for (;;) {
+		char *str;
+
+		/*
+		 *	pre-allocate the node so we don't have to steal it later.
+		 */
+		node = xlat_exp_alloc_null(our_ctx);
+
+		/*
+		 *	Find the next token
+		 */
+		len = fr_sbuff_out_aunescape_until(node, &str, in, SIZE_MAX, tokens, escapes);
+
+		/*
+		 *	It's a literal, create a literal node...
+		 */
+		if (len > 0) {
+			xlat_exp_set_type(node, XLAT_LITERAL);
+			xlat_exp_set_name_buffer_shallow(node, str);
+
+			XLAT_DEBUG("LITERAL <-- %pV",
+				   fr_box_strvalue_len(str, talloc_array_length(str) - 1));
+			node->async_safe = true; /* literals are always true */
+			fr_cursor_insert(&cursor, node);
+			our_ctx = node;
+			node = NULL;
 		}
 
-		if ((*p == '"') || (*p == '\'')) {
-			slen = fr_skip_string(p, end);
-			if (slen < 0) return slen - (p - start);
+		if (fr_sbuff_adv_past_str_literal(in, "%{")) {
+			if (len == 0) TALLOC_FREE(node); /* Free the empty node */
 
-			p += slen;
+			if (xlat_tokenize_expansion(our_ctx, &node, in, ar_rules) < 0) {
+			error:
+				*head = NULL;
+				talloc_free(node);
+				fr_cursor_head(&cursor);
+				fr_cursor_free_list(&cursor);
+
+				/*
+				 *	Free our temporary array of terminals
+				 */
+				if (tokens != &expansions) talloc_free(tokens);
+				return -1;
+			}
+			fr_cursor_insert(&cursor, node);
+			our_ctx = node;
+			node = NULL;
 			continue;
 		}
 
-		if ((*p == '%') && ((p + 1) < end) && (p[1] == '{')) {
-			slen = skip_xlat(p, end);
-			if (slen < 0) return slen - (p - start);
-			p += slen;
+		/*
+		 *	%[a-z] - A one letter expansion
+		 */
+		if (fr_sbuff_next_if_char(in, '%') && fr_sbuff_is_alpha(in)) {
+			XLAT_DEBUG("ONE-LETTER <-- %pV",
+				   fr_box_strvalue_len(str, talloc_array_length(str) - 1));
+
+			if (len == 0) {
+				talloc_free_children(node);	/* re-use empty nodes */
+			} else {
+				node = xlat_exp_alloc_null(our_ctx);
+			}
+
+			fr_sbuff_out_abstrncpy(node, &str, in, 1);
+			xlat_exp_set_type(node, XLAT_ONE_LETTER);
+			xlat_exp_set_name_buffer_shallow(node, str);
+
+			node->async_safe = true; /* literals are always true */
+			fr_cursor_insert(&cursor, node);
+			our_ctx = node;
+			node = NULL;
 			continue;
 		}
 
-		p++;
+		/*
+		 *	We were told to look for a brace, but we ran off of
+		 *	the end of the string before we found one.
+		 */
+		if (brace) {
+			if (len == 0) TALLOC_FREE(node); /* Free the empty node */
+
+			if (!fr_sbuff_is_char(in, '}')) {
+				fr_strerror_printf("Missing closing brace");
+				goto error;
+			}
+		/*
+		 *	We're parsing the string *containing* the xlat
+		 *	expansions.
+		 */
+		} else {
+			/*	If we have an empty node, finish building it and
+			 *	emit it.
+			 *
+			 *	We're about to return, and it's a useful
+			 *	indication to the caller that this wasn't a parse
+			 *	error but just an empty string.
+			 */
+			if (len == 0) {
+				/*
+				 *	This isn't the only node in the sequence
+				 *	don't emit an empty trailing literal.
+				 */
+				if (*head) {
+					talloc_free(node);
+					break;
+				}
+
+				xlat_exp_set_type(node, XLAT_LITERAL);
+				xlat_exp_set_name_buffer_shallow(node, str);
+
+				XLAT_DEBUG("LITERAL <-- (empty)");
+				node->async_safe = true; /* literals are always true */
+				fr_cursor_insert(&cursor, node);
+			}
+		}
+		break;
 	}
 
-	return -(p - start);
+	/*
+	 *	Free our temporary array of terminals
+	 */
+	if (tokens != &expansions) talloc_free(tokens);
+
+	return 0;
 }
+
+static fr_table_num_sorted_t const xlat_quote_table[] = {
+	{ L("\""),	T_DOUBLE_QUOTED_STRING	},	/* Don't re-order, backslash throws off ordering */
+	{ L("'"),	T_SINGLE_QUOTED_STRING	},
+	{ L("`"),	T_BACK_QUOTED_STRING	}
+};
+static size_t xlat_quote_table_len = NUM_ELEMENTS(xlat_quote_table);
 
 /** Tokenize an xlat expansion into a series of XLAT_TYPE_CHILD arguments
  *
  * @param[in] ctx	to allocate dynamic buffers in.
  * @param[out] head	the head of the xlat list / tree structure.
  * @param[in] in	the format string to expand.
- * @param[in] inlen	the length of the input string.  If the string is \0 terminated, inlen may be -1.
- * @param[in] rules	controlling how attribute references are parsed.
+ * @param[in] ar_rules	controlling how attribute references are parsed.
  * @return
  *	- <=0 on error.
  *	- >0  on success which is the number of characters parsed.
  */
-ssize_t xlat_tokenize_argv(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, size_t inlen,
-			   tmpl_rules_t const *rules)
+ssize_t xlat_tokenize_argv(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+			   fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules)
 {
-	char const *p, *end;
-	ssize_t slen;
-	xlat_exp_t *node, *my_head, **last;
-	TALLOC_CTX *my_ctx;
-	int count = 0;
+	fr_sbuff_t			our_in = FR_SBUFF_NO_ADVANCE(in);
+	ssize_t				slen;
+	TALLOC_CTX			*our_ctx = ctx;
+	fr_cursor_t			cursor;
+	fr_sbuff_marker_t		m;
+	fr_sbuff_parse_rules_t const	*our_p_rules;	/* Bareword parse rules */
 
-	p = in;
-	end = in + inlen;
+	*head = NULL;
 
-	my_head = NULL;
-	last = &my_head;
-	my_ctx = ctx;
+	if (p_rules && p_rules->terminals) {
+		our_p_rules = &(fr_sbuff_parse_rules_t){
+			.terminals = fr_sbuff_terminals_amerge(NULL, p_rules->terminals,
+							       tmpl_parse_rules_bareword_quoted.terminals),
+			.escapes = tmpl_parse_rules_bareword_quoted.escapes
+		};
+	} else {
+		our_p_rules = &tmpl_parse_rules_bareword_quoted;
+	}
 
-	while (p < end) {
+	/*
+	 *	skip spaces at the beginning as we
+	 *	don't want them to become a whitespace
+	 *	literal.
+	 */
+	fr_sbuff_adv_past_whitespace(in, SIZE_MAX);
+	fr_sbuff_marker(&m, &our_in);
+
+	fr_cursor_init(&cursor, head);
+	while (!FR_SBUFF_CANT_EXTEND(&our_in)) {
+		xlat_exp_t	*node = NULL;
+		fr_token_t	type;
+		char		*fmt;
+		size_t		len;
+
+		fr_sbuff_set(&m, &our_in);	/* Record start of argument */
+
+		fr_sbuff_out_by_longest_prefix(&slen, &type, xlat_quote_table, &our_in, T_BARE_WORD);
+
 		/*
-		 *	Skip spaces between command-line arguments.
+		 *	Alloc a new node to hold the child nodes
+		 *	that make up the argument.
 		 */
-		if (isspace((int) *p)) {
-			while ((p < end) && isspace((int) *p)) p++;
+		node = xlat_exp_alloc_null(our_ctx);
+		xlat_exp_set_type(node, XLAT_CHILD);
 
-			continue;
-		}
-
-		*last = node = talloc_zero(my_ctx, xlat_exp_t);
-		node->fmt = NULL;
-		node->len = 0;
-		node->type = XLAT_CHILD;
-		count++;
-
+		switch (type) {
 		/*
-		 *	Back-tick quoted strings are forbidden.
+		 *	Barewords --may-contain=%{expansions}
 		 */
-		if (*p == '`') {
-			fr_strerror_printf("Unexpected `...` string");
-			talloc_free(my_head);
-			return -(p - in);
-		}
-
-		/*
-		 *	Look for quoted strings.
-		 */
-		if ((*p == '"') || (*p == '\'')) {
-			slen = fr_skip_string(p, end);
-			if (slen < 0) return slen - (p - in);
-
-		} else {
-			char const *q = p;
-
-			/*
-			 *	Bare words can contain xlat expansions.
-			 *
-			 *	--foo=%{Bar}
-			 */
-			while ((q < end) && !isspace((int) *q)) {
-				/*
-				 *	Things like: echo foo"bar"
-				 *	are forbidden.
-				 *
-				 *	The Unix shell typically allows this
-				 *	kind of nonsense, but there's no reason
-				 *	for us to do so.
-				 */
-				if ((*q == '`') || (*q == '"') || (*q == '\'')) {
-					fr_strerror_printf("Unexpected quoted string");
-					talloc_free(my_head);
-					return -(q - in);
+		case T_BARE_WORD:
+			if (xlat_tokenize_literal(node, &node->child, &our_in,
+						  false, our_p_rules, ar_rules) < 0) {
+			error:
+				if (our_p_rules != &tmpl_parse_rules_bareword_quoted) {
+					talloc_const_free(our_p_rules->terminals);
 				}
-
-				if (*q == '%') {
-					if (q[1] != '{') {
-						slen = 2;
-					} else {
-						slen = skip_xlat(q, end);
-						if (slen < 0) return slen - (q - in);
-					}
-
-					q += slen;
-					continue;
-				}
-
-				q++;
+				talloc_free(node);
+				fr_cursor_free_list(&cursor);
+				return -fr_sbuff_used(&our_in);	/* error */
 			}
-			slen = q - p;
-		}
+			break;
 
 		/*
-		 *	Tokenize this literal as a child.
+		 *	"Double quoted strings may contain %{expansions}"
 		 */
-		slen = xlat_tokenize_literal(node, &node->child, p, slen, false, rules);
-		if (slen <= 0) {
-			talloc_free(my_head);
-			return slen - (p - in);
-		}
+		case T_DOUBLE_QUOTED_STRING:
+			if (xlat_tokenize_literal(node, &node->child, &our_in,
+						  false, &tmpl_parse_rules_double_quoted, ar_rules) < 0) goto error;
+			break;
 
 		/*
-		 *	Arguments MUST be separated by spaces.
+		 *	'Single quoted strings get parsed as literals'
 		 */
-		if (((p + slen) < end) && !isspace((int) p[slen])) {
-			talloc_free(my_head);
-			fr_strerror_printf("Unexpected text after argument");
-			p += slen;
-			return -(p - in);
+		case T_SINGLE_QUOTED_STRING:
+		{
+			char		*str;
+
+			node->child = xlat_exp_alloc_null(node);
+			xlat_exp_set_type(node->child, XLAT_LITERAL);
+
+			slen = fr_sbuff_out_aunescape_until(node->child, &str, &our_in, SIZE_MAX,
+							    tmpl_parse_rules_single_quoted.terminals,
+							    tmpl_parse_rules_single_quoted.escapes);
+			if (slen < 0) goto error;
+			xlat_exp_set_name_buffer_shallow(node->child, str);
 		}
+			break;
 
 		/*
-		 *	Remember how much of the current string we allocated.
+		 *	`back quoted strings aren't supported`
 		 */
-		node->fmt = talloc_bstrndup(node, p, slen);
-		node->len = slen;
+		case T_BACK_QUOTED_STRING:
+			fr_strerror_printf("Unexpected `...` string");
+			goto error;
+
+		default:
+			fr_assert(0);
+			break;
+		}
+
+		if ((type != T_BARE_WORD) && !fr_sbuff_next_if_char(&our_in, fr_token_quote[type])) { /* Quoting */
+			fr_strerror_printf("Unterminated string");
+			fr_sbuff_set(&our_in, &m);
+			goto error;
+		}
+
+		fmt = talloc_bstrndup(node, fr_sbuff_current(&m), fr_sbuff_behind(&m));
+		xlat_exp_set_name_buffer_shallow(node, fmt);
+		node->quote = type;
 		node->async_safe = node->child->async_safe;
-		p += slen;
+
+		fr_cursor_insert(&cursor, node);
+		our_ctx = node;
+		node = NULL;
 
 		/*
-		 *	Parent the next node from the previous one.
-		 *	This lets us free everything in one swell foop
-		 *	on error.
+		 *	If we're not and the end of the string
+		 *	and there's no whitespace between tokens
+		 *	then error.
 		 */
-		my_ctx = node;
-		last = &(node->next);
+		fr_sbuff_set(&m, &our_in);
+		len = fr_sbuff_adv_past_whitespace(&our_in, SIZE_MAX);
+
+		/*
+		 *	Check to see if we have a terminal char
+		 */
+		if ((p_rules && p_rules->terminals) && fr_sbuff_is_terminal(&our_in, p_rules->terminals)) break;
+
+		/*
+		 *	Otherwise, if we can extend, and found
+		 *	no additional whitespace, it means two
+		 *	arguments were smushed together.
+		 */
+		if (!FR_SBUFF_CANT_EXTEND(&our_in) && (len == 0)) {
+			fr_strerror_printf("Unexpected text after argument");
+			goto error;
+		}
 	}
 
-	if (!my_head) {
-		fr_strerror_printf("Empty string is invalid");
-		return -1;
+	if (our_p_rules != &tmpl_parse_rules_bareword_quoted) {
+		talloc_const_free(our_p_rules->terminals);
 	}
 
-	*head = my_head;
-	my_head->count = count;
-	return p - in;
+	return fr_sbuff_set(in, &our_in);
 }
 
 static void xlat_tokenize_debug(REQUEST *request, xlat_exp_t const *node)
@@ -1008,106 +1054,75 @@ static void xlat_tokenize_debug(REQUEST *request, xlat_exp_t const *node)
 	REXDENT();
 }
 
-size_t xlat_snprint(char *out, size_t outlen, xlat_exp_t const *node)
+ssize_t xlat_print(fr_sbuff_t *out, xlat_exp_t const *node)
 {
-	char *p, *end;
+	ssize_t			slen;
+	size_t			at_in = fr_sbuff_used_total(out);
 
-	if (!node || (outlen <= 2)) {
-		*out = '\0';
-		return 0;
-	}
-
-	p = out;
-	end = out + outlen;
-
-#define CHECK_SPACE(_p, _end) if (_p >= _end) goto oob
+	if (!node) return 0;
 
 	while (node) {
-		if ((node->type == XLAT_LITERAL) || (node->type == XLAT_CHILD)) {
-			p += strlcpy(p, node->fmt, end - p);
-			CHECK_SPACE(p, end);
+		switch (node->type) {
+		case XLAT_LITERAL:
+		case XLAT_CHILD:
+			FR_SBUFF_IN_BSTRCPY_BUFFER_RETURN(out, node->fmt);
 			goto next;
+
+		case XLAT_ONE_LETTER:
+			FR_SBUFF_IN_CHAR_RETURN(out, '%', node->fmt[0]);
+			goto next;
+
+		default:
+			break;
 		}
 
-		if (node->type == XLAT_ONE_LETTER) {
-			*(p++) = '%';
-			if (p >= end) {
-			oob:
-				out[outlen - 1] = '\0';
-				return outlen + 1;
-			}
-
-			*(p++) = node->fmt[0];
-			CHECK_SPACE(p, end);
-			goto next;
-		}
-
-		*(p++) = '%';
-		CHECK_SPACE(p, end);
-		*(p++) = '{';
-		CHECK_SPACE(p, end);
-
+		FR_SBUFF_IN_STRCPY_LITERAL_RETURN(out, "%{");
 		switch (node->type) {
 		case XLAT_ATTRIBUTE:
-		{
-			size_t need;
-
-			p += tmpl_snprint_attr_str(&need, p, end - p, node->attr);
-			if (need > 0) goto oob;
-		}
+			slen = tmpl_print_attr_str(out, node->attr);
+			if (slen < 0) {
+			error:
+				return slen;
+			}
 			break;
 #ifdef HAVE_REGEX
 		case XLAT_REGEX:
-			p += snprintf(p, end - p, "%i", node->regex_index);
-			CHECK_SPACE(p, end);
+			FR_SBUFF_IN_SPRINTF_RETURN(out, "%i", node->regex_index);
 			break;
 #endif
 		case XLAT_VIRTUAL:
-			p += strlcpy(p, node->fmt, end - p);
-			CHECK_SPACE(p, end);
+			FR_SBUFF_IN_BSTRCPY_BUFFER_RETURN(out, node->fmt);
 			break;
 
 		case XLAT_FUNC:
-			p += strlcpy(p, node->xlat->name, end - p);
-			CHECK_SPACE(p, end);
-
-			*(p++) = ':';
-			CHECK_SPACE(p, end);
+			FR_SBUFF_IN_BSTRCPY_BUFFER_RETURN(out, node->xlat->name);
+			FR_SBUFF_IN_CHAR_RETURN(out, ':');
 
 			if (node->child) {
-				p += xlat_snprint(p, end - p, node->child);
-				CHECK_SPACE(p, end);
+				slen = xlat_print(out, node->child);
+				if (slen < 0) goto error;
 			}
 			break;
 
 		case XLAT_ALTERNATE:
-			p += xlat_snprint(p, end - p, node->child);
-			CHECK_SPACE(p, end);
+			slen = xlat_print(out, node->child);
+			if (slen < 0) goto error;
 
-			*(p++) = ':';
-			CHECK_SPACE(p, end);
-			*(p++) = '-';
-			CHECK_SPACE(p, end);
-
-			p += xlat_snprint(p, end - p, node->alternate);
-			CHECK_SPACE(p, end);
+			FR_SBUFF_IN_STRCPY_LITERAL_RETURN(out, ":-");
+			slen = xlat_print(out, node->alternate);
+			if (slen < 0) goto error;
 			break;
 
 		default:
 			fr_assert_fail(NULL);
 			break;
 		}
-
-		*(p++) = '}';
-		CHECK_SPACE(p, end);
-
+		FR_SBUFF_IN_CHAR_RETURN(out, '}');
 	next:
 		node = node->next;
 	}
 
-	*p = '\0';
-
-	return p - out;
+	return fr_sbuff_used(out) - at_in;
 }
 
 /** Tokenize an xlat expansion at runtime
@@ -1118,43 +1133,36 @@ size_t xlat_snprint(char *out, size_t outlen, xlat_exp_t const *node)
  * @param[in] ctx	to allocate dynamic buffers in.
  * @param[out] head	the head of the xlat list / tree structure.
  * @param[in] request	the input request.  Memory will be attached here.
- * @param[in] fmt	the format string to expand.
- * @param[in] rules	controlling how attribute references are parsed.
+ * @param[in] in	the format string to expand.
+ * @param[in] p_rules	from the encompassing grammar.
+ * @param[in] ar_rules	controlling how attribute references are parsed.
  * @return
- *	- <= -1 on error.  Return value is negative offset of where parsing
- *	  error occured.
- *	- >= 0 on success.  The number of bytes parsed.
+ *	- >0 on success.
+ *	- 0 and *head == NULL - Parse failure on first char.
+ *	- 0 and *head != NULL - Zero length expansion
+ *	- <0 the negative offset of the parse failure.
  */
 ssize_t xlat_tokenize_ephemeral(TALLOC_CTX *ctx, xlat_exp_t **head, REQUEST *request,
-			        char const *fmt, tmpl_rules_t const *rules)
+			        fr_sbuff_t *in,
+			        fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules)
 {
-	ssize_t		slen;
+	fr_sbuff_t	our_in = FR_SBUFF_NO_ADVANCE(in);
 
 	*head = NULL;
 
 	fr_strerror();	/* Clear error buffer */
-	slen = xlat_tokenize_literal(request, head, fmt, strlen(fmt), false, rules);
+	if (xlat_tokenize_literal(request, head, &our_in, false, p_rules, ar_rules) < 0) return -fr_sbuff_used(&our_in);
 
 	/*
 	 *	Zero length expansion, return a zero length node.
 	 */
-	if (slen == 0) {
+	if (fr_sbuff_used(&our_in) == 0) {
 		MEM(*head = talloc_zero(ctx, xlat_exp_t));
 		(*head)->async_safe = true;
 	}
 
-	/*
-	 *	Output something like:
-	 *
-	 *	"format string"
-	 *	"       ^ error was here"
-	 */
-	if (slen < 0) {
-		return slen;
-	}
-
-	if (*head && RDEBUG_ENABLED3) {
-		RDEBUG3("%s", fmt);
+	if (RDEBUG_ENABLED3) {
+		RDEBUG3("%pV", fr_box_strvalue_len(fr_sbuff_start(&our_in), fr_sbuff_used(&our_in)));
 		RDEBUG3("Parsed xlat tree:");
 		xlat_tokenize_debug(request, *head);
 	}
@@ -1163,13 +1171,12 @@ ssize_t xlat_tokenize_ephemeral(TALLOC_CTX *ctx, xlat_exp_t **head, REQUEST *req
 	 *	Create ephemeral instance data for the xlat
 	 */
 	if (xlat_instantiate_ephemeral(*head) < 0) {
-		talloc_free(*head);
-
 		fr_strerror_printf("Failed performing ephemeral instantiation for xlat");
-		return -1;
+		TALLOC_FREE(*head);
+		return 0;
 	}
 
-	return slen;
+	return fr_sbuff_set(in, &our_in);
 }
 
 /** Tokenize an xlat expansion
@@ -1177,23 +1184,25 @@ ssize_t xlat_tokenize_ephemeral(TALLOC_CTX *ctx, xlat_exp_t **head, REQUEST *req
  * @param[in] ctx	to allocate dynamic buffers in.
  * @param[out] head	the head of the xlat list / tree structure.
  * @param[in] in	the format string to expand.
- * @param[in] inlen	the length of the input string.  If the string is \0 terminated, inlen may be -1.
- * @param[in] rules	controlling how attribute references are parsed.
+ * @param[in] p_rules	controlling how the string containing the xlat
+ *			expansions should be parsed.
+ * @param[in] ar_rules	controlling how attribute references are parsed.
  * @return
- *	- <0 on error.
- *	- 0 on success.
+ *	- >0 on success.
+ *	- 0 and *head == NULL - Parse failure on first char.
+ *	- 0 and *head != NULL - Zero length expansion
+ *	- < 0 the negative offset of the parse failure.
  */
-ssize_t xlat_tokenize(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, ssize_t inlen, tmpl_rules_t const *rules)
+ssize_t xlat_tokenize(TALLOC_CTX *ctx, xlat_exp_t **head, fr_sbuff_t *in,
+		      fr_sbuff_parse_rules_t const *p_rules, tmpl_rules_t const *ar_rules)
 {
-	int ret;
+	fr_sbuff_t	our_in = FR_SBUFF_NO_ADVANCE(in);
 
 	*head = NULL;
 
-	if (inlen < 0) inlen = strlen(in);
-
 	fr_strerror();	/* Clear error buffer */
-	ret = xlat_tokenize_literal(ctx, head, in, inlen, false, rules);
-	if (ret < 0) return ret;
+
+	if (xlat_tokenize_literal(ctx, head, &our_in, false, p_rules, ar_rules) < 0) return -fr_sbuff_used(&our_in);
 
 	/*
 	 *	Add nodes that need to be bootstrapped to
@@ -1201,9 +1210,50 @@ ssize_t xlat_tokenize(TALLOC_CTX *ctx, xlat_exp_t **head, char const *in, ssize_
 	 */
 	if (xlat_bootstrap(*head) < 0) {
 		TALLOC_FREE(*head);
-		return -1;
+		return 0;
 	}
 
-	return ret;
+	return fr_sbuff_set(in, &our_in);
+}
+
+/** Check to see if the expansion consists entirely of literal elements
+ *
+ * @param[in] head	to check.
+ * @return
+ *	- true if expansion contains only literal elements.
+ *	- false if expansion contains expandable elements.
+ */
+bool xlat_is_literal(xlat_exp_t const *head)
+{
+	xlat_exp_t const *node;
+
+	for (node = head;
+	     node;
+	     node = node->next) {
+		if (node->type != XLAT_LITERAL) return false;
+	}
+
+	return true;
+}
+
+/** Convert an xlat node to an unescaped literal string and free the original node
+ *
+ * @param[in] ctx	to allocate the new string in.
+ * @param[out] str	a duplicate of the node's fmt string.
+ * @param[in,out] head	to convert.
+ * @return
+ *	- true	the tree consists of a single literal node which was converted.
+ *      - false the tree was more complex than a single literal, op was a noop.
+ */
+bool xlat_to_literal(TALLOC_CTX *ctx, char **str, xlat_exp_t **head)
+{
+	if (!*head) return false;
+
+	if (!xlat_is_literal(*head)) return false;
+
+	*str = talloc_bstrdup(ctx, (*head)->fmt);
+	TALLOC_FREE(*head);
+
+	return true;
 }
 

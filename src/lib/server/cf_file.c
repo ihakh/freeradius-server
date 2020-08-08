@@ -1199,7 +1199,6 @@ static int cf_file_fill(cf_stack_t *stack);
 static CONF_ITEM *process_if(cf_stack_t *stack)
 {
 	ssize_t slen = 0;
-	char const *error = NULL;
 	fr_cond_t *cond = NULL;
 	CONF_DATA const *cd;
 	fr_dict_t const *dict = NULL;
@@ -1222,11 +1221,7 @@ static CONF_ITEM *process_if(cf_stack_t *stack)
 	if (invalid_location(parent, buff[1], frame->filename, frame->lineno)) return NULL;
 
 	cd = cf_data_find_in_parent(parent, fr_dict_t **, "dictionary");
-	if (!cd) {
-		dict = fr_dict_internal();	/* HACK - To fix policy sections */
-	} else {
-		dict = *((fr_dict_t **)cf_data_value(cd));
-	}
+	if (cd) dict = *((fr_dict_t **)cf_data_value(cd));
 
 	/*
 	 *	fr_cond_tokenize needs the current section, so we
@@ -1245,7 +1240,7 @@ static CONF_ITEM *process_if(cf_stack_t *stack)
 	 *	Skip (...) to find the {
 	 */
 	while (true) {
-		slen = fr_cond_tokenize(cs, &cond, &error, dict, ptr, strlen(ptr));
+		slen = fr_cond_tokenize(cs, &cond, dict, &FR_SBUFF_IN(ptr, strlen(ptr)));
 		if (slen < 0) {
 			ssize_t end = -slen;
 
@@ -1289,7 +1284,7 @@ static CONF_ITEM *process_if(cf_stack_t *stack)
 
 		cf_log_err(cs, "Parse error in condition");
 		cf_log_err(cs, "%s", text);
-		cf_log_err(cs, "%s^ %s", spaces, error);
+		cf_log_err(cs, "%s^ %s", spaces, fr_strerror());
 
 		talloc_free(spaces);
 		talloc_free(text);
@@ -2370,7 +2365,7 @@ int cf_section_write(FILE *fp, CONF_SECTION *cs, int depth)
 		if (c) {
 			char buffer[1024];
 
-			cond_snprint(NULL, buffer, sizeof(buffer), c);
+			cond_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), c);
 			fprintf(fp, "(%s)", buffer);
 
 		} else {	/* dump the string as-is */

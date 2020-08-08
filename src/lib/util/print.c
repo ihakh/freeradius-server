@@ -224,10 +224,10 @@ char const *fr_utf8_strchr(int *out_chr_len, char const *str, ssize_t inlen, cha
  * @note Return value should be checked with is_truncated
  * @note Will always \0 terminate unless outlen == 0.
  *
- * @param[in] in	string to escape.
- * @param[in] inlen	length of string to escape (lets us deal with embedded NULs)
  * @param[out] out	where to write the escaped string.
  * @param[out] outlen	the length of the buffer pointed to by out.
+ * @param[in] in	string to escape.
+ * @param[in] inlen	length of string to escape (lets us deal with embedded NULs)
  * @param[in] quote	the quotation character
  * @return
  *	- The number of bytes written to the out buffer.

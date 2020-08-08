@@ -1168,7 +1168,6 @@ static size_t command_condition_normalise(command_result_t *result, command_file
 					  char *data, UNUSED size_t data_used, char *in, size_t inlen)
 {
 	ssize_t			dec_len;
-	char const		*error = NULL;
 	fr_cond_t		*cond;
 	CONF_SECTION		*cs;
 	size_t			len;
@@ -1181,9 +1180,10 @@ static size_t command_condition_normalise(command_result_t *result, command_file
 	cf_filename_set(cs, cc->filename);
 	cf_lineno_set(cs, cc->lineno);
 
-	dec_len = fr_cond_tokenize(cs, &cond, &error, cc->active_dict ? cc->active_dict : cc->config->dict, in, inlen);
+	dec_len = fr_cond_tokenize(cs, &cond,
+				   cc->active_dict ? cc->active_dict : cc->config->dict, &FR_SBUFF_IN(in, inlen));
 	if (dec_len <= 0) {
-		fr_strerror_printf("ERROR offset %d %s", (int) -dec_len, error);
+		fr_strerror_printf("ERROR offset %d %s", (int) -dec_len, fr_strerror());
 
 	return_error:
 		talloc_free(cs);
@@ -1203,7 +1203,7 @@ static size_t command_condition_normalise(command_result_t *result, command_file
 		goto return_error;
 	}
 
-	len = cond_snprint(NULL, data, COMMAND_OUTPUT_MAX, cond);
+	len = cond_print(&FR_SBUFF_OUT(data, COMMAND_OUTPUT_MAX), cond);
 	talloc_free(cs);
 
 	RETURN_OK(len);
@@ -2143,36 +2143,31 @@ static size_t command_write(command_result_t *result, command_file_ctx_t *cc,
 static size_t command_xlat_normalise(command_result_t *result, command_file_ctx_t *cc,
 				     char *data, UNUSED size_t data_used, char *in, UNUSED size_t inlen)
 {
-	ssize_t		dec_len;
-	size_t		len;
-	char		*fmt;
-	xlat_exp_t	*head = NULL;
-	size_t		input_len = strlen(in), escaped_len;
-	char		buff[1024];
+	ssize_t			dec_len;
+	size_t			len;
+	xlat_exp_t		*head = NULL;
+	size_t			input_len = strlen(in), escaped_len;
+	char			buff[1024];
+	fr_sbuff_parse_rules_t	p_rules = { .escapes = &fr_value_escape_double };
 
-	/*
-	 *	Process special chars, octal escape sequences and hex sequences
-	 */
-	len = fr_value_str_aunescape(NULL, &fmt, &FR_SBUFF_IN(in, input_len), SIZE_MAX, '\"');
-	fr_assert(fmt);
-	dec_len = xlat_tokenize(fmt, &head, fmt, len,
+	dec_len = xlat_tokenize(NULL, &head, &FR_SBUFF_IN(in, input_len), &p_rules,
 				&(tmpl_rules_t) { .dict_def = cc->active_dict ? cc->active_dict : cc->config->dict });
 	if (dec_len <= 0) {
 		fr_strerror_printf_push("ERROR offset %d", (int) -dec_len);
 
 	return_error:
-		talloc_free(fmt);
+		TALLOC_FREE(head);
 		RETURN_OK_WITH_ERROR();
 	}
 
-	if (((size_t) dec_len != len) || (fmt[dec_len] != '\0')) {
+	if (((size_t) dec_len != input_len)) {
 		fr_strerror_printf_push("offset %d 'Too much text'", (int) dec_len);
 		goto return_error;
 	}
 
-	len = xlat_snprint(buff, sizeof(buff), head);
+	len = xlat_print(&FR_SBUFF_OUT(buff, sizeof(buff)), head);
 	escaped_len = fr_snprint(data, COMMAND_OUTPUT_MAX, buff, len, '"');
-	talloc_free(fmt);
+	TALLOC_FREE(head);
 
 	RETURN_OK(escaped_len);
 }
@@ -2192,7 +2187,8 @@ static size_t command_xlat_argv(command_result_t *result, command_file_ctx_t *cc
 	size_t		input_len = strlen(in);
 	char		buff[1024];
 
-	slen = xlat_tokenize_argv(cc->tmp_ctx, &head, in, input_len,
+	slen = xlat_tokenize_argv(cc->tmp_ctx, &head, &FR_SBUFF_IN(in, input_len),
+				  NULL,
 				  &(tmpl_rules_t) { .dict_def = cc->active_dict ? cc->active_dict : cc->config->dict });
 	if (slen <= 0) {
 		fr_strerror_printf_push("ERROR offset %d", (int) -slen);
@@ -2206,7 +2202,7 @@ static size_t command_xlat_argv(command_result_t *result, command_file_ctx_t *cc
 	}
 
 	for (i = 0, p = data; i < argc; i++) {
-		(void)  xlat_snprint(buff, sizeof(buff), argv[i]);
+		(void)  xlat_print(&FR_SBUFF_OUT(buff, sizeof(buff)), argv[i]);
 
 		len = snprintf(p, data + COMMAND_OUTPUT_MAX - p, "[%d]{ %s }, ", i, buff);
 		p += len;

@@ -407,7 +407,7 @@ int trigger_exec(REQUEST *request, CONF_SECTION const *cs, char const *name, boo
 		fake->log.lvl = fr_debug_lvl;
 	}
 
-	slen = xlat_tokenize_argv(ctx, &ctx->xlat, ctx->name, talloc_array_length(ctx->name) - 1, NULL);
+	slen = xlat_tokenize_argv(ctx, &ctx->xlat, &FR_SBUFF_IN(ctx->name, talloc_array_length(ctx->name) - 1), NULL, NULL);
 	if (slen <= 0) {
 		char *spaces, *text;
 

@@ -44,27 +44,20 @@ RCSID("$Id$")
 /** Map keywords to #pair_list_t values
  */
 static fr_table_num_sorted_t const cond_type_table[] = {
-	{ L("child"),	COND_TYPE_CHILD			},
-	{ L("exists"),	COND_TYPE_EXISTS		},
-	{ L("false"),	COND_TYPE_FALSE			},
-	{ L("invalid"),	COND_TYPE_INVALID		},
-	{ L("map"),	COND_TYPE_MAP			},
-	{ L("true"),	COND_TYPE_TRUE			},
+	{ L("child"),		COND_TYPE_CHILD		},
+	{ L("exists"),		COND_TYPE_EXISTS	},
+	{ L("false"),		COND_TYPE_FALSE		},
+	{ L("invalid"),		COND_TYPE_INVALID	},
+	{ L("map"),		COND_TYPE_MAP		},
+	{ L("true"),		COND_TYPE_TRUE		},
 };
 static size_t cond_type_table_len = NUM_ELEMENTS(cond_type_table);
 
-static fr_table_num_sorted_t const cond_op_table[] = {
-	{ L("none"),	COND_NONE			},
-	{ L("&&"),		COND_AND			},
-	{ L("||"),		COND_OR				},
-};
-static size_t cond_op_table_len = NUM_ELEMENTS(cond_op_table);
-
 static fr_table_num_sorted_t const cond_pass2_table[] = {
-	{ L("none"),	PASS2_FIXUP_NONE		},
-	{ L("attr"),	PASS2_FIXUP_ATTR		},
-	{ L("type"),	PASS2_FIXUP_TYPE		},
-	{ L("paircompre"),	PASS2_PAIRCOMPARE		},
+	{ L("none"),		PASS2_FIXUP_NONE	},
+	{ L("attr"),		PASS2_FIXUP_ATTR	},
+	{ L("type"),		PASS2_FIXUP_TYPE	},
+	{ L("paircompre"),	PASS2_PAIRCOMPARE	},
 };
 static size_t cond_pass2_table_len = NUM_ELEMENTS(cond_pass2_table);
 
@@ -88,28 +81,34 @@ static bool all_digits(char const *string)
  */
 void cond_debug(fr_cond_t const *cond)
 {
-	fr_cond_t const *next;
+	fr_cond_t const *c;
 
-	for (next = cond; next; next = next->next) {
-		INFO("cond %s (%p)", fr_table_str_by_value(cond_type_table, cond->type, "<INVALID>"), cond);
-		INFO("\tnegate : %s", cond->negate ? "true" : "false");
-		INFO("\tcast   : %s", cond->cast ? fr_table_str_by_value(fr_value_box_type_table,
-									 cond->cast->type, "<INVALID>") : "none");
-		INFO("\top     : %s", fr_table_str_by_value(cond_op_table, cond->next_op, "<INVALID>"));
-		INFO("\tfixup  : %s", fr_table_str_by_value(cond_pass2_table, cond->pass2_fixup, "<INVALID>"));
+	for (c = cond; c; c =c->next) {
+		INFO("cond %s (%p)", fr_table_str_by_value(cond_type_table, c->type, "<INVALID>"), cond);
+		INFO("\tnegate : %s", c->negate ? "true" : "false");
+		INFO("\tcast   : %s", c->cast ? fr_table_str_by_value(fr_value_box_type_table,
+								      c->cast->type, "<INVALID>") : "none");
+		INFO("\top     : %s", fr_table_str_by_value(cond_logical_op_table, c->next_op, "<INVALID>"));
+		INFO("\tfixup  : %s", fr_table_str_by_value(cond_pass2_table, c->pass2_fixup, "<INVALID>"));
 
-		switch (cond->type) {
+		switch (c->type) {
 		case COND_TYPE_MAP:
-			tmpl_attr_debug(cond->data.map->lhs);
-			tmpl_attr_debug(cond->data.map->rhs);
+			INFO("lhs (");
+			tmpl_debug(c->data.map->lhs);
+			INFO(")");
+			INFO("rhs (");
+			tmpl_debug(c->data.map->rhs);
+			INFO(")");
 			break;
 
 		case COND_TYPE_EXISTS:
-			tmpl_attr_debug(cond->data.vpt);
+			tmpl_debug(c->data.vpt);
 			break;
 
 		case COND_TYPE_CHILD:
-			cond_debug(cond->next);
+			INFO("child (");
+			cond_debug(c->data.child);
+			INFO(")");
 			break;
 
 		default:
@@ -190,6 +189,7 @@ int cond_eval_tmpl(REQUEST *request, int modreturn, UNUSED int depth, tmpl_t con
 	 */
 	case TMPL_TYPE_REGEX_UNPARSED:
 	case TMPL_TYPE_REGEX:
+	case TMPL_TYPE_REGEX_XLAT:
 		fr_assert(0 == 1);
 		FALL_THROUGH;
 
@@ -440,11 +440,6 @@ static int cond_normalise_and_cmp(REQUEST *request, fr_cond_t const *c, fr_value
 
 	/*
 	 *	Cast operand to correct type.
-	 *
-	 *	With hack for strings that look like integers, to cast them
-	 *	to 64 bit unsigned integers.
-	 *
-	 * @fixme For things like this it'd be useful to have a 64bit signed type.
 	 */
 #define CAST(_s) \
 do {\
@@ -453,7 +448,7 @@ do {\
 			   fr_table_str_by_value(fr_value_box_type_table, _s->type, "<INVALID>"),\
 			   fr_table_str_by_value(fr_value_box_type_table, cast_type, "<INVALID>"));\
 		if (fr_value_box_cast(request, &_s ## _cast, cast_type, cast, _s) < 0) {\
-			RPEDEBUG("Failed casting " #_s " operand");\
+			if (request) RPEDEBUG("Failed casting " #_s " operand");\
 			rcode = -1;\
 			goto finish;\
 		}\
@@ -602,6 +597,7 @@ do {\
 	 *	RHS is a compiled regex, we don't need to do anything with it.
 	 */
 	case TMPL_TYPE_REGEX:
+	case TMPL_TYPE_REGEX_XLAT:
 		CAST(lhs);
 		rcode = cond_cmp_values(request, c, lhs, NULL);
 		break;
@@ -720,8 +716,9 @@ int cond_eval_map(REQUEST *request, UNUSED int modreturn, UNUSED int depth, fr_c
 	case TMPL_TYPE_NULL:
 	case TMPL_TYPE_ATTR_UNPARSED:
 	case TMPL_TYPE_UNINITIALISED:
-	case TMPL_TYPE_REGEX_UNPARSED:		/* should now be a TMPL_TYPE_REGEX or TMPL_TYPE_XLAT */
-	case TMPL_TYPE_REGEX:	/* not allowed as LHS */
+	case TMPL_TYPE_REGEX_UNPARSED:		/* should now be a TMPL_TYPE_REGEX or TMPL_TYPE_REGEX_XLAT */
+	case TMPL_TYPE_REGEX:			/* not allowed as LHS */
+	case TMPL_TYPE_REGEX_XLAT:		/* not allowed as LHS */
 	case TMPL_TYPE_MAX:
 		fr_assert(0);
 		rcode = -1;
@@ -751,7 +748,7 @@ int cond_eval(REQUEST *request, int modreturn, int depth, fr_cond_t const *c)
 #ifdef WITH_EVAL_DEBUG
 	char buffer[1024];
 
-	cond_snprint(NULL, buffer, sizeof(buffer), c);
+	cond_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), c);
 	EVAL_DEBUG("%s", buffer);
 #endif
 

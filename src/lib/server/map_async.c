@@ -80,7 +80,7 @@ static inline vp_list_mod_t *list_mod_generic_afrom_map(TALLOC_CTX *ctx,
 	if (!n->mod) return NULL;
 	n->mod->lhs = mutated->lhs;
 	n->mod->op = mutated->op;
-	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_DATA, NULL, -1, T_BARE_WORD);
+	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_DATA, T_BARE_WORD, NULL, 0);
 	if (!n->mod->rhs) {
 		talloc_free(n);
 		return NULL;
@@ -120,7 +120,7 @@ static inline vp_list_mod_t *list_mod_delete_afrom_map(TALLOC_CTX *ctx,
 
 	n->mod->lhs = mutated->lhs;
 	n->mod->op = T_OP_CMP_FALSE;	/* Means delete the LHS */
-	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_NULL, NULL, -1, T_BARE_WORD);
+	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_NULL, T_BARE_WORD, NULL, 0);
 	if (!n->mod->rhs) {
 		talloc_free(n);
 		return NULL;
@@ -165,7 +165,7 @@ static inline vp_list_mod_t *list_mod_empty_string_afrom_map(TALLOC_CTX *ctx,
 
 	n->mod->lhs = mutated->lhs;
 	n->mod->op = mutated->op;
-	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_DATA, NULL, -1, T_DOUBLE_QUOTED_STRING);
+	n->mod->rhs = tmpl_alloc(n->mod, TMPL_TYPE_DATA, T_DOUBLE_QUOTED_STRING, NULL, -1);
 	if (!n->mod->rhs) {
 		talloc_free(n);
 		return NULL;
@@ -389,7 +389,7 @@ int map_to_list_mod(TALLOC_CTX *ctx, vp_list_mod_t **out,
 			 *	the attribute, with the same destination list
 			 *	as the current LHS map.
 			 */
-			n_mod->lhs = tmpl_alloc(n, TMPL_TYPE_ATTR, mutated->lhs->name, mutated->lhs->len, T_BARE_WORD);
+			n_mod->lhs = tmpl_alloc(n, TMPL_TYPE_ATTR, T_BARE_WORD, mutated->lhs->name, mutated->lhs->len);
 			if (!n_mod->lhs) goto error;
 
 			if (tmpl_attr_copy(n_mod->lhs, mutated->lhs) < 0) goto error;
@@ -401,9 +401,9 @@ int map_to_list_mod(TALLOC_CTX *ctx, vp_list_mod_t **out,
 			 *	For the RHS we copy the value of the attribute
 			 *	we just found, creating data (literal) tmpl.
 			 */
-			n_mod->rhs = tmpl_alloc(n_mod, TMPL_TYPE_DATA, NULL, -1,
-					    	vp->data.type == FR_TYPE_STRING ?
-					    	T_DOUBLE_QUOTED_STRING : T_BARE_WORD);
+			n_mod->rhs = tmpl_alloc(n_mod, TMPL_TYPE_DATA,
+					        vp->data.type == FR_TYPE_STRING ? T_DOUBLE_QUOTED_STRING : T_BARE_WORD,
+					        NULL, 0);
 			if (!n_mod->rhs) goto error;
 
 			/*
@@ -876,14 +876,14 @@ static inline void map_list_mod_debug(REQUEST *request,
 
 	/*
 	 *	For the lists, we can't use the original name, and have to
-	 *	rebuild it using tmpl_snprint, for each attribute we're
+	 *	rebuild it using tmpl_print, for each attribute we're
 	 *	copying.
 	 */
 	case TMPL_TYPE_LIST:
 	{
 		char buffer[256];
 
-		tmpl_snprint(NULL, buffer, sizeof(buffer), map->rhs);
+		tmpl_print(&FR_SBUFF_OUT(buffer, sizeof(buffer)), map->rhs);
 		rhs = fr_asprintf(request, "%s -> %s%pV%s", buffer, quote, vb, quote);
 	}
 		break;

@@ -988,7 +988,10 @@ static ssize_t xlat_func_explode(TALLOC_CTX *ctx, char **out, size_t outlen,
 	 */
 	fr_skip_whitespace(p);
 
-	slen = tmpl_afrom_attr_substr(ctx, NULL, &vpt, p, -1, &(tmpl_rules_t){ .dict_def = request->dict });
+	slen = tmpl_afrom_attr_substr(ctx, NULL, &vpt,
+				      &FR_SBUFF_IN(p, strlen(p)),
+				      NULL,
+				      &(tmpl_rules_t){ .dict_def = request->dict });
 	if (slen <= 0) {
 		RPEDEBUG("Invalid input");
 		return -1;
@@ -1231,7 +1234,10 @@ static ssize_t parse_pad(tmpl_t **vpt_p, size_t *pad_len_p, char *pad_char_p, RE
 		return 0;
 	}
 
-	slen = tmpl_afrom_attr_substr(request, NULL, &vpt, p, -1, &(tmpl_rules_t){ .dict_def = request->dict });
+	slen = tmpl_afrom_attr_substr(request, NULL, &vpt,
+				      &FR_SBUFF_IN(p, strlen(p)),
+				      NULL,
+				      &(tmpl_rules_t){ .dict_def = request->dict });
 	if (slen <= 0) {
 		RPEDEBUG("Failed parsing input string");
 		return slen;
@@ -1834,7 +1840,7 @@ static xlat_action_t xlat_func_hex(TALLOC_CTX *ctx, fr_cursor_t *out,
 	if (!*in) return XLAT_ACTION_DONE;
 
 	/*
-	 * Concatenate all input
+	 *	Concatenate all input
 	 */
 	if (fr_value_box_list_concat(ctx, *in, in, FR_TYPE_OCTETS, true) < 0) {
 		RPEDEBUG("Failed concatenating input");
@@ -2834,7 +2840,7 @@ static xlat_action_t xlat_func_sub_regex(TALLOC_CTX *ctx, fr_cursor_t *out,
 
 	memset(&flags, 0, sizeof(flags));
 
-	slen = regex_flags_parse(NULL, &flags, p, q - p, true);
+	slen = regex_flags_parse(NULL, &flags, &FR_SBUFF_IN(p, q), NULL, true);
 	if (slen < 0) {
 		RPEDEBUG("Failed parsing regex flags");
 		return XLAT_ACTION_FAIL;

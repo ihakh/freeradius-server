@@ -876,7 +876,7 @@ static int CC_HINT(nonnull(4,5)) cf_pair_parse_internal(TALLOC_CTX *ctx, void *o
  *			Should be one of the following ``data`` types,
  *			and one or more of the following ``flag`` types or'd together:
  *	- ``data`` #FR_TYPE_TMPL 		- @copybrief FR_TYPE_TMPL
- *					  	  Feeds the value into #tmpl_afrom_str. Value can be
+ *					  	  Feeds the value into #tmpl_afrom_substr. Value can be
  *					  	  obtained when processing requests, with #tmpl_expand or #tmpl_aexpand.
  *	- ``data`` #FR_TYPE_BOOL		- @copybrief FR_TYPE_BOOL
  *	- ``data`` #FR_TYPE_UINT32		- @copybrief FR_TYPE_UINT32
@@ -1309,6 +1309,8 @@ int cf_section_parse_pass2(void *base, CONF_SECTION *cs)
 		CONF_PARSER	*rule;
 		void		*data;
 		int		type;
+		CONF_DATA	*cd;
+		fr_dict_t const	*dict = NULL;
 
 		rule = cf_data_value(rule_cd);
 
@@ -1384,6 +1386,13 @@ int cf_section_parse_pass2(void *base, CONF_SECTION *cs)
 		}
 
 		/*
+		 *	Search for dictionary data somewhere in the virtual
+		 *      server.
+		 */
+		cd = cf_data_find_in_parent(cs, fr_dict_t **, "dictionary");
+		if (cd) dict = *((fr_dict_t **)cf_data_value(cd));
+
+		/*
 		 *	Parse (and throw away) the xlat string (for validation).
 		 *
 		 *	FIXME: All of these should be converted from FR_TYPE_XLAT
@@ -1399,7 +1408,14 @@ int cf_section_parse_pass2(void *base, CONF_SECTION *cs)
 			/*
 			 *	xlat expansions should be parseable.
 			 */
-			slen = xlat_tokenize(cs, &xlat, cp->value, talloc_array_length(cp->value) - 1, NULL);
+			slen = xlat_tokenize(cs, &xlat,
+					     &FR_SBUFF_IN(cp->value, talloc_array_length(cp->value) - 1), NULL,
+					     &(tmpl_rules_t){
+						.dict_def = dict,
+						.allow_unknown = false,
+						.allow_unparsed = false,
+						.allow_foreign = (dict == NULL)
+					     });
 			if (slen < 0) {
 				char *spaces, *text;
 
@@ -1430,15 +1446,21 @@ int cf_section_parse_pass2(void *base, CONF_SECTION *cs)
 		 *	Parse the pair into a template
 		 */
 		} else if (is_tmpl) {
-			ssize_t	slen;
+			ssize_t		slen;
+			tmpl_t	**out = (tmpl_t **)data;
+			tmpl_t	*vpt;
+			fr_token_t	quote = cf_pair_value_quote(cp);
 
-			tmpl_t **out = (tmpl_t **)data;
-			tmpl_t *vpt;
-
-			slen = tmpl_afrom_str(cs, &vpt, cp->value, talloc_array_length(cp->value) - 1,
-					      cf_pair_value_quote(cp),
-					      &(tmpl_rules_t){ .allow_unknown = true, .allow_unparsed = true },
-					      true);
+			slen = tmpl_afrom_substr(cs, &vpt,
+						 &FR_SBUFF_IN(cp->value, talloc_array_length(cp->value) - 1),
+						 quote,
+						 NULL,
+						 &(tmpl_rules_t){
+						 	.dict_def = dict,
+						 	.allow_unknown = false,
+						 	.allow_unparsed = false,
+						 	.allow_foreign = (dict == NULL)
+						 });
 			if (slen < 0) {
 				char *spaces, *text;
 
@@ -1479,6 +1501,7 @@ int cf_section_parse_pass2(void *base, CONF_SECTION *cs)
 			case TMPL_TYPE_UNINITIALISED:
 			case TMPL_TYPE_REGEX_UNPARSED:
 			case TMPL_TYPE_REGEX:
+			case TMPL_TYPE_REGEX_XLAT:
 			case TMPL_TYPE_NULL:
 			case TMPL_TYPE_MAX:
 				fr_assert(0);

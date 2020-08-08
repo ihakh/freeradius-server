@@ -156,6 +156,7 @@ static unlang_action_t list_mod_create(REQUEST *request, rlm_rcode_t *presult)
 
 			case TMPL_TYPE_REGEX_UNPARSED:
 			case TMPL_TYPE_REGEX:
+			case TMPL_TYPE_REGEX_XLAT:
 			case TMPL_TYPE_XLAT_UNPARSED:
 				fr_assert(0);
 			error:
@@ -191,6 +192,7 @@ static unlang_action_t list_mod_create(REQUEST *request, rlm_rcode_t *presult)
 
 			case TMPL_TYPE_REGEX_UNPARSED:
 			case TMPL_TYPE_REGEX:
+			case TMPL_TYPE_REGEX_XLAT:
 			case TMPL_TYPE_XLAT_UNPARSED:
 				fr_assert(0);
 				goto error;
@@ -341,6 +343,7 @@ static unlang_action_t unlang_map_state_init(REQUEST *request, rlm_rcode_t *pres
 
 	case TMPL_TYPE_REGEX_UNPARSED:
 	case TMPL_TYPE_REGEX:
+	case TMPL_TYPE_REGEX_XLAT:
 	case TMPL_TYPE_XLAT_UNPARSED:
 		fr_assert(0);
 		goto error;

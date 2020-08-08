@@ -417,9 +417,14 @@ static int mod_instantiate(void *instance, CONF_SECTION *conf)
 			goto no_domain;
 		}
 
-		tmpl_afrom_str(instance, &inst->wb_domain, wb_info->netbios_domain,
-			       strlen(wb_info->netbios_domain), T_SINGLE_QUOTED_STRING,
-			       &(tmpl_rules_t){ .allow_unknown = true, .allow_unparsed = true }, false);
+		tmpl_afrom_substr(instance, &inst->wb_domain,
+			          &FR_SBUFF_IN(wb_info->netbios_domain, strlen(wb_info->netbios_domain)),
+			          T_SINGLE_QUOTED_STRING.
+			          NULL,
+			          &(tmpl_rules_t){
+			          	.allow_unknown = true,
+			          	.allow_unparsed = true
+			          });
 
 		cf_log_err(conf, "Using winbind_domain '%s'", inst->wb_domain->name);
 

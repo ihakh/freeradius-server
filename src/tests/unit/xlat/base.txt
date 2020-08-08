@@ -10,17 +10,17 @@ xlat the quick brown fox jumped over the lazy dog
 match the quick brown fox jumped over the lazy dog
 
 # The second % should not be present in the output.  We should also not see 'Missing closing brace' type errors
-xlat should not start %%{expansion
+xlat should not start \%{expansion
 match should not start %{expansion
 
 xlat %
-match ERROR offset 1: Invalid variable expansion
+match %
 
-xlat %%
+xlat \%
 match %
 
 xlat \
-match ERROR offset 0: Invalid escape at end of string
+match \\
 
 #
 #  Regex capture groups
@@ -35,13 +35,13 @@ xlat %{33}
 match ERROR offset 2: Invalid regex reference.  Must be in range 0-32
 
 xlat %{3a}
-match ERROR offset 2: Unknown attribute
+match ERROR offset 3: Unexpected text after attribute reference
 
 xlat %{-3}
 match ERROR offset 2: Unknown attribute
 
 xlat %{3
-match ERROR offset 1: No matching closing brace
+match ERROR offset 3: Missing closing brace
 
 #
 #  Tests for xlat expansion
@@ -132,10 +132,10 @@ xlat %{length}
 match ERROR offset 2: Unknown attribute
 
 xlat %{length:
-match ERROR offset 1: No matching closing brace
+match ERROR offset 9: Missing closing brace
 
 xlat %{length:1 + 2
-match ERROR offset 14: Missing closing brace at end of string
+match ERROR offset 14: Missing closing brace
 
 xlat \"%t\tfoo\"
 match \"%t\tfoo\"
@@ -192,24 +192,24 @@ xlat %{%{}:-foo}
 match ERROR offset 4: Empty expression is invalid
 
 xlat %{%{User-Name}:-
-match ERROR offset 2: No matching closing brace
+match ERROR offset 16: Missing closing brace
 
 # Discuss - Not sure the offset/message is correct here, but not sure if we can determine the correct offset either
 xlat %{%{User-Name}:-foo
-match ERROR offset 19: Missing closing brace at end of string
+match ERROR offset 19: Missing closing brace
 
 xlat %{%{User-Name}:}
-match ERROR offset 15: Expected '-' after ':'
+match ERROR offset 14: Expected ':-' after first expansion
 
 xlat %{%{User-Name}}
-match ERROR offset 14: Expected ':' after first expansion, got '}'
+match ERROR offset 14: Expected ':-' after first expansion
 
 
 #
 #  Empty and malformed expansions
 #
 xlat %{
-match ERROR offset 1: No matching closing brace
+match ERROR offset 2: Missing closing brace
 
 xlat %{}
 match ERROR offset 2: Empty expression is invalid
@@ -233,10 +233,10 @@ xlat %{ }
 match ERROR offset 2: Invalid char ' ' in expression
 
 xlat %{\t}
-match ERROR offset 2: Invalid char '\t' in expression
+match ERROR offset 2: Invalid attribute name
 
 xlat %{\n}
-match ERROR offset 2: Invalid char '\n' in expression
+match ERROR offset 2: Invalid attribute name
 
 xlat %{foo }
 match ERROR offset 5: Invalid char ' ' in expression
@@ -245,17 +245,17 @@ xlat %{foo bar}
 match ERROR offset 5: Invalid char ' ' in expression
 
 xlat %{test:
-match ERROR offset 1: No matching closing brace
+match ERROR offset 7: Missing closing brace
 
 xlat %{test:%{User-Name
-match ERROR offset 8: No matching closing brace
+match ERROR offset 18: Missing closing brace
 
 # Discuss - Not sure the offset/message is correct here, but not sure if we can determine the correct offset either
 xlat %{test:%{User-Name}
-match ERROR offset 19: Missing closing brace at end of string
+match ERROR offset 19: Missing closing brace
 
 xlat %{myfirstxlat
-match ERROR offset 1: No matching closing brace
+match ERROR offset 13: Missing closing brace
 
 #
 #  API to split xlat strings into argv-style arguments.
@@ -264,27 +264,27 @@ xlat_argv /bin/sh %{User-Name}
 match [0]{ /bin/sh }, [1]{ %{User-Name} }
 
 xlat_argv /bin/sh "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ "%{User-Name}" }
+match [0]{ /bin/sh }, [1]{ %{User-Name} }
 
 # with quotes
 xlat_argv /bin/sh "foo" "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ "foo" }, [2]{ "%{User-Name}" }
+match [0]{ /bin/sh }, [1]{ foo }, [2]{ %{User-Name} }
 
 # many spaces between arguments
 xlat_argv /bin/sh         "foo"       "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ "foo" }, [2]{ "%{User-Name}" }
+match [0]{ /bin/sh }, [1]{ foo }, [2]{ %{User-Name} }
 
 # and spaces in quotes
 xlat_argv /bin/sh "foo bar" "%{User-Name}"
-match [0]{ /bin/sh }, [1]{ "foo bar" }, [2]{ "%{User-Name}" }
+match [0]{ /bin/sh }, [1]{ foo bar }, [2]{ %{User-Name} }
 
 # and multiple xlats inside of quotes
 xlat_argv /bin/sh "foo bar" "%{User-Name} %{Filter-Id}"
-match [0]{ /bin/sh }, [1]{ "foo bar" }, [2]{ "%{User-Name} %{Filter-Id}" }
+match [0]{ /bin/sh }, [1]{ foo bar }, [2]{ %{User-Name} %{Filter-Id} }
 
 # and errors
 xlat_argv /bin/sh "foo bar" "%{User-Name} %{Filter-Id"
-match ERROR offset 33: No matching closing brace
+match ERROR offset 44: Missing closing brace
 
 # and text immediately after a variable expansion
 xlat_argv echo hello %{Tmp-String-0}:1234 world

@@ -89,7 +89,7 @@ static unlang_action_t unlang_switch(REQUEST *request, UNUSED rlm_rcode_t *presu
 		len = tmpl_aexpand(request, &p, request, g->vpt, NULL, NULL);
 		if (len < 0) goto find_null_case;
 		data.vb_strvalue = p;
-		tmpl_init(&vpt, TMPL_TYPE_UNPARSED, data.vb_strvalue, len, T_SINGLE_QUOTED_STRING);
+		tmpl_init_shallow(&vpt, TMPL_TYPE_UNPARSED, T_SINGLE_QUOTED_STRING, data.vb_strvalue, len);
 	}
 
 	/*

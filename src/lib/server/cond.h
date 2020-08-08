@@ -45,6 +45,12 @@ typedef enum {
 	COND_OR = '|'
 } fr_cond_op_t;
 
+extern fr_table_num_sorted_t const cond_logical_op_table[];
+extern size_t cond_logical_op_table_len;
+
+extern fr_table_num_sorted_t const cond_cmp_op_table[];
+extern size_t cond_cmp_op_table_len;
+
 typedef enum {
 	COND_TYPE_INVALID = 0,
 	COND_TYPE_TRUE,
@@ -89,9 +95,8 @@ struct fr_cond_s {
 	fr_cond_t		*next;
 };
 
-ssize_t fr_cond_tokenize(CONF_SECTION *cs, fr_cond_t **head, char const **error,
-			 fr_dict_t const *dict, char const *in, size_t inlen) CC_HINT(nonnull);
-size_t cond_snprint(size_t *need, char *buffer, size_t bufsize, fr_cond_t const *c);
+ssize_t fr_cond_tokenize(CONF_SECTION *cs, fr_cond_t **head, fr_dict_t const *dict, fr_sbuff_t *in) CC_HINT(nonnull(1,2,4));
+ssize_t cond_print(fr_sbuff_t *out, fr_cond_t const *c);
 
 bool fr_cond_walk(fr_cond_t *head, bool (*callback)(fr_cond_t *cond, void *uctx), void *uctx);
 

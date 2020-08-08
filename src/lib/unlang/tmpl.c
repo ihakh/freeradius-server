@@ -578,7 +578,9 @@ static unlang_action_t unlang_tmpl(REQUEST *request, rlm_rcode_t *presult)
 		ssize_t slen;
 		xlat_exp_t *head = NULL;
 
-		slen = xlat_tokenize_argv(state->ctx, &head, ut->tmpl->name, talloc_array_length(ut->tmpl->name) - 1, NULL);
+		slen = xlat_tokenize_argv(state->ctx, &head,
+					  &FR_SBUFF_IN(ut->tmpl->name, talloc_array_length(ut->tmpl->name) - 1),
+					  NULL, NULL);
 		if (slen <= 0) {
 			char *spaces, *text;
 
@@ -605,7 +607,7 @@ static unlang_action_t unlang_tmpl(REQUEST *request, rlm_rcode_t *presult)
 }
 
 
-void unlang_tmpl_init(void)
+void unlang_tmpl_init_shallow(void)
 {
 	unlang_register(UNLANG_TYPE_TMPL,
 			   &(unlang_op_t){
